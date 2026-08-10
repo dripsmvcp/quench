@@ -1,0 +1,1001 @@
+#include "runtime/engine.h"
+#include "core/buffer.h"
+#include "vision/image_processor.h"
+#include "vision/qwen3vl_vision_load.h"
+#include "vision/vision_pipeline.h"
+#include "runtime/request.h"
+#include "lora/lora_adapter.h"
+#include "runtime/engine_internal.h"
+#include "runtime/config.h"
+#include "runtime/process_diag.h"
+#include "runtime/vram_budget.h"
+#include "runtime/batch.h"
+#include "compute/mtp_forward.h"
+#include "compute/rope.h"  // rope_yarn_corr_dims (MTP rope-scaling parity)
+#include "compute/encoder_forward.h"
+#include "memory/kv_cache.h"
+#include "memory/mem_account.h"
+#include "memory/engine_arena.h"
+#include "memory/graph_slots.h"
+#include "memory/plan.h"
+#include "exec/workspace_sizes.h"
+#include "memory/backend.h"
+#include "memory/vram_query.h"
+#include "model/gguf_loader.h"
+#include "model/chat_template.h"
+#include "compute/ffn_sparsity_probe.h"
+#include "compute/gemm.h"
+#include "compute/mmq_q8_imma.h"
+#include "compute/gemm_capture_fp16_sm120.h"
+#include "compute/gemm_cutlass_grouped_3x.h"
+#include "compute/attention_cublas.h"
+#include "compute/gemm_grouped.h"
+#include "compute/sampling.h"
+#include "compute/attention.h"
+#include "compute/layernorm.h"
+#include "core/logging.h"
+#include "core/cuda_static_reset.h"
+
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <chrono>
+#include <algorithm>
+#include <functional>
+#include <vector>
+
+namespace quench {
+
+// File-local helpers were lifted to runtime/engine_internal.h so that
+// the per-subsystem engine_*.cpp translation units (Phase 4 Tasks 2-7)
+// can share them.
+
+Engine::~Engine() {
+    // Cross-model CUDA-error-leak guard. The CUDA error state is per primary
+    // context, NOT per Engine, so a pending ("sticky") error left by this
+    // model's workload survives quench_context_free / quench_model_free and is then
+    // observed by the NEXT model loaded in the same process. That next model's
+    // first cudaGetLastError()-guarded kernel — notably the NVFP4 CUTLASS GEMM
+    // (gemm_cutlass_sm120.cu: "Flush any prior async errors") — bails to a
+    // silent false return, producing degenerate garbage instead of running.
+    // Observed repro: a GDN/SSM model (Qwen3.5) loaded before a Gemma-4 NVFP4
+    // model garbled Gemma-4 ("own own else else"), while a dense or MoE
+    // predecessor did not. Drain it here so it cannot cross the model boundary.
+    if (cudaError_t leaked = cudaGetLastError(); leaked != cudaSuccess) {
+        QUENCH_LOG_WARN(
+            "Engine teardown: cleared a leaked CUDA error (%s) so it cannot "
+            "corrupt the next model loaded in this process",
+            cudaGetErrorString(leaked));
+    }
+
+    // Phase-0 VRAM audit: stop the peak sampler and emit the final table
+    // (captures the device-used peak reached during the workload).
+    // Teardown allocates nothing but frees plenty; leaving the process in
+    // Serving would make the next engine's init look like an I2 violation.
+    set_alloc_phase(AllocPhase::Loading);
+    if (const uint64_t n = steady_state_allocations(); n > 0) {
+        QUENCH_LOG_WARN(
+            "I2: %llu device allocation(s) were made while serving — "
+            "see the per-tag warnings above (criterion 3 requires zero)",
+            static_cast<unsigned long long>(n));
+    }
+    MemAccount::instance().sampler_stop();
+    MemAccount::instance().report("shutdown");
+    engine_arena_close();
+    // The arena is gone; every module static that took a slice from it is now
+    // holding a dangling pointer. reset_static_cuda_state() re-arms exactly
+    // those (gemm_reset_static_cuda_state's own comment says "the region
+    // belongs to the T2 arena, which ~Engine closes") — it was only ever wired
+    // to quench_api_suspend.cpp, so a SECOND engine in one process reused freed
+    // memory. gemm_init() guards with `if (!s_workspace)`, so the stale pointer
+    // survived and cuBLASLt matmul'd into it: status 14, fallback, illegal
+    // memory access, and every later test in the process died on a context it
+    // did not break. Must run AFTER the arena closes, not before.
+    reset_static_cuda_state();
+
+    // Save prefix cache to disk before shutdown (dense only — hybrid reuse
+    // needs recurrent snapshots, which are device-resident and not persisted)
+    if (kv_manager_ && !config_.prefix_cache_path.empty() && kv_manager_->prefix_caching_enabled() &&
+        !ssm_state_) {
+        kv_manager_->save_prefix_cache(config_.prefix_cache_path, model_fingerprint_(), stream_);
+    }
+
+    // FFN sparsity probe (Vector 1 research instrumentation): drain per-layer
+    // counters to stderr if any decode steps ran with the probe enabled.
+    flush_ffn_sparsity_probe_log();
+
+    gemm_cleanup();
+    gemm_grouped_cleanup();
+    sampling_cleanup();
+    if (async_graph_runner_.is_setup()) {
+        async_graph_runner_.cleanup();
+    }
+    // Strictly after the runner teardown above: closing the pool frees the
+    // slots, so a lease still outstanding here means something is holding
+    // addresses into memory that is about to go away. The pool logs that as an
+    // error rather than letting it pass silently.
+    graph_slot_pool().close();
+    if (async_d_block_tables_) {
+        QUENCH_CUDA_CHECK_LOG(cudaFree(async_d_block_tables_));
+        async_d_block_tables_ = nullptr;
+    }
+    if (async_d_block_tables_swa_) {
+        QUENCH_CUDA_CHECK_LOG(cudaFree(async_d_block_tables_swa_));
+        async_d_block_tables_swa_ = nullptr;
+    }
+    if (d_banned_tokens_) {
+        QUENCH_CUDA_CHECK_LOG(cudaFree(d_banned_tokens_));
+        d_banned_tokens_ = nullptr;
+    }
+    if (swa_snap_slab_) {
+        QUENCH_CUDA_CHECK_LOG(cudaFree(swa_snap_slab_));
+        swa_snap_slab_ = nullptr;
+    }
+    free_mrope_buffers_();
+    if (d_penalty_tokens_) {
+        vram_alloc_.free(d_penalty_tokens_);
+        d_penalty_tokens_ = nullptr;
+    }
+    if (d_embed_pool_scratch_) {
+        vram_alloc_.free(d_embed_pool_scratch_);
+        d_embed_pool_scratch_ = nullptr;
+    }
+    if (d_token_is_whitespace_) {
+        vram_alloc_.free(d_token_is_whitespace_);
+        d_token_is_whitespace_ = nullptr;
+    }
+    if (d_kv_slot_buf_) {
+        cudaFree(d_kv_slot_buf_);
+        d_kv_slot_buf_ = nullptr;
+    }
+    abandon_decode_pipeline();
+    for (int p = 0; p < 2; ++p) {
+        // T5b owners release themselves; the d_* mirrors are views into them, so
+        // they only need nulling (memory/host_pinned.h).
+        h_bt_patch_off_[p].reset();
+        h_bt_patch_val_[p].reset();
+        h_hist_pos_[p].reset();
+        d_bt_patch_off_[p] = nullptr;
+        d_bt_patch_val_[p] = nullptr;
+        d_hist_pos_[p] = nullptr;
+    }
+    if (d_pipe_hist_) {
+        QUENCH_CUDA_CHECK_LOG(cudaFree(d_pipe_hist_));
+        d_pipe_hist_ = nullptr;
+    }
+    log_spec_stats_();
+    free_spec_buffers_();
+    if (prefill_pool_) {
+        vram_alloc_.free(prefill_pool_);
+        prefill_pool_ = nullptr;
+    }
+    if (pf_staging_evt_) {
+        QUENCH_CUDA_CHECK_LOG(cudaEventDestroy(pf_staging_evt_));
+        pf_staging_evt_ = nullptr;
+    }
+    // Encoder embedder workspace cleanup
+    if (encoder_ws_storage_) {
+        auto* ews = static_cast<quench::EncoderWorkspace*>(encoder_ws_storage_);
+        quench::encoder_workspace_free(*ews);
+        delete ews;
+        encoder_ws_storage_ = nullptr;
+    }
+    // MTP spec-decode workspace cleanup
+    if (mtp_ws_storage_) {
+        auto* ws = static_cast<quench::MtpDraftWorkspace*>(mtp_ws_storage_);
+        quench::mtp_workspace_free(*ws);
+        delete ws;
+        mtp_ws_storage_ = nullptr;
+        mtp_spec_k_ = 0;
+    }
+    // stream_, prefill_done_, decode_done_ cleaned up by CudaStream/CudaEvent RAII
+    // vision_ cleaned up by VisionPipeline RAII
+}
+
+
+// (mtp_prefill_prompt was replaced by the per-chunk mtp_prefill_feed_chunk
+// in engine_spec_mtp.cpp — chunked-prefill capable, DeepSeek-aligned pairing,
+// feed-only forwards without the lm_head GEMV.)
+
+
+bool Engine::encoder_embed(const int32_t* tokens, int n, std::vector<float>& out) {
+    if (encoder_ws_storage_ == nullptr || !model_) {
+        QUENCH_LOG_ERROR("encoder_embed: no encoder workspace (not an encoder model?)");
+        return false;
+    }
+    auto* ews = static_cast<quench::EncoderWorkspace*>(encoder_ws_storage_);
+    out.resize(model_->config_.d_model);
+    return quench::encoder_embed(*model_, *ews, tokens, n, out.data(), stream_);
+}
+
+
+// =====================================================================
+// Helper methods
+// =====================================================================
+
+cudaStream_t Engine::prefill_stream() const {
+    return (config_.use_green_contexts && green_ctx_.is_available()) ? green_ctx_.prefill_stream() : stream_;
+}
+
+cudaStream_t Engine::decode_stream() const {
+    return (config_.use_green_contexts && green_ctx_.is_available()) ? green_ctx_.decode_stream() : stream_;
+}
+
+void Engine::reset_ssm_state(int seq_id) {
+    // Public teardown entry point (API re-prefill / context reset / server
+    // cancellation). Reset the sequence's ACTUAL allocated recurrent slot, then
+    // return it to the free list — otherwise the slot leaks (these paths bypass
+    // finish_request) and the pool exhausts, forcing every later request onto
+    // the legacy id%cap aliasing fallback.
+    auto it = recurrent_slot_of_.find(seq_id);
+    if (ssm_state_) {
+        const int cap = ssm_state_->max_sequences();
+        int slot = (it != recurrent_slot_of_.end()) ? it->second : (cap > 0 ? seq_id % cap : 0);
+        ssm_state_->reset_sequence(slot, stream_);
+    }
+    release_recurrent_slot_(seq_id);
+}
+
+void Engine::reset_batch_pool_cache() { decode_batch_pool_.reset_upload_cache(); }
+
+void Engine::invalidate_graphs() {
+    // Exception/reset path: an in-flight pipelined decode step must not be
+    // waited on (the context may be poisoned) — drop it and release the
+    // deferred KV so the sequences don't leak blocks.
+    abandon_decode_pipeline();
+
+    // Preserve decode_graph_pool_ across context resets — the decode step
+    // topology (forward_logits) doesn't change between requests. Inputs
+    // (token IDs, positions, block tables) are uploaded fresh each step via
+    // the batch pool. Per-entry invalidation already handles max_blocks_per_seq
+    // changes in step_decode_forward(). Re-capturing on every benchmark rep
+    // adds ~100ms overhead per reset.
+    //
+    // The conditional graph runner MUST be invalidated: it captures the full
+    // decode loop including token feedback, stop conditions, and request-specific
+    // KV block pointers.
+    if (async_graph_runner_.is_setup()) {
+        async_graph_runner_.cleanup();
+    }
+    async_graph_req_ = nullptr;
+    async_pending_tokens_.clear();
+    async_pending_cursor_ = 0;
+
+    // The pipelined constrained decode holds a captured forward graph plus
+    // request-specific device state — same invalidation requirement as the
+    // conditional runner.
+    if (cpipe_.active)
+        teardown_constrained_pipeline(/*synchronize=*/true);
+
+    // Captured verify-chunk graphs baked the forward as well (incl.
+    // any active LoRA kernels/pointers) — recapture costs two verify steps.
+    free_spec_graphs_();
+    // Verify-in-loop: an in-flight burst must complete before its
+    // baked buffers/KV go away; the runner recaptures lazily afterwards.
+
+    // safety net: if an exception unwound past an active prefill-chunk
+    // capture, the prefill stream is still in capture state and every later
+    // op on it fails ("previous error during capture") — permanently wedging
+    // the server. Close any stray capture and drop the prefill runner so the
+    // next request starts from a clean stream.
+    prefill_graph_runner_.invalidate();
+    last_prefill_chunk_len_ = -1;
+    last_prefill_block_count_ = -1;
+    abort_stream_capture(prefill_stream());
+}
+
+int Engine::lora_load(const std::string& path) {
+    auto a = std::make_unique<LoraAdapter>();
+    if (!a->load(path, model_ ? model_->n_layers() : 0))
+        return 0;
+    lora_adapters_.push_back(std::move(a));
+    return static_cast<int>(lora_adapters_.size());  // 1-based id
+}
+
+bool Engine::lora_set(int id) {
+    if (id < 0 || id > static_cast<int>(lora_adapters_.size()))
+        return false;
+    if (id == active_lora_)
+        return true;
+    active_lora_ = id;
+    executor_->set_lora(id == 0 ? nullptr : lora_adapters_[id - 1].get());
+    // Decode graphs captured the previous forward (with/without the LoRA
+    // kernels and with the old adapter's pointers) — drop everything,
+    // including the per-batch pool that invalidate_graphs() preserves.
+    invalidate_graphs();
+    for (auto& g : decode_graph_pool_)
+        g.invalidate();
+    QUENCH_LOG_INFO("LoRA: active adapter -> %d%s", id, id == 0 ? " (base)" : "");
+    return true;
+}
+
+size_t Engine::effective_free_vram() const {
+    // Budget-aware view (installed in init from config_.vram_budget_mb).
+    // The old inline formula counted GLOBAL device usage against the budget,
+    // which mis-charged a co-tenant server's memory to this process;
+    // vram_query uses the process baseline delta instead.
+    size_t free_mem = 0;
+    if (!vram_budget_mem_get_info(&free_mem, nullptr))
+        return 0;
+    return free_mem;
+}
+
+void Engine::finish_request(std::shared_ptr<Request>& req) {
+    req->status = RequestStatus::FINISHED;
+    finish_request_release_(req);
+}
+
+// KV/slot release half of finish_request. Split out so the pipelined batched
+// decode can mark a row FINISHED (stream delivery proceeds) while deferring
+// the KV free until the in-flight chained step — which still WRITES this
+// row's next KV slot — has completed (bd_pipe_.deferred_release).
+void Engine::finish_request_release_(std::shared_ptr<Request>& req) {
+    if (kv_manager_->prefix_caching_enabled()) {
+        // Register input AND generated tokens — minus the final sampled
+        // token, which was never forwarded (its KV entry does not exist; the
+        // spec-verify bonus token has the same property). The next agent turn
+        // re-sends the assistant reply verbatim (tool-call JSON, code edits),
+        // and its KV is live in the block table right now: hashing it turns
+        // the whole previous turn into a prefix-cache hit instead of
+        // re-prefilling the reply from scratch.
+        if (req->output_tokens.size() > 1) {
+            std::vector<int32_t> forwarded;
+            forwarded.reserve(req->input_tokens.size() + req->output_tokens.size() - 1);
+            forwarded.insert(forwarded.end(), req->input_tokens.begin(), req->input_tokens.end());
+            forwarded.insert(forwarded.end(), req->output_tokens.begin(), req->output_tokens.end() - 1);
+            kv_manager_->register_block_hashes(req->id, forwarded);
+            // SWA window snapshot over the SAME span: without it the hashed
+            // generated blocks are unusable under SWA sizing (the next turn's
+            // reuse limit stops at the last snapshot boundary — the prefill
+            // end). Must run before free_sequence recycles the window blocks;
+            // hard_sync because those blocks are re-allocatable the moment
+            // free_sequence returns (writers on other streams).
+            maybe_save_swa_snapshot_span_(req->id, forwarded, stream_, /*hard_sync=*/true);
+        } else {
+            kv_manager_->register_block_hashes(req->id, req->input_tokens);
+        }
+        // cache_control / cache_prompt: protect the prompt's full blocks
+        // from eviction (must happen before free_sequence — pinning needs
+        // the live block table). A breakpoint boundary caps the pin
+        // to the prompt tokens before the last cache_control marker.
+        if (req->pin_kv_prefix) {
+            int pin_tokens = static_cast<int>(req->input_tokens.size());
+            if (req->pin_kv_prefix_tokens >= 0 && req->pin_kv_prefix_tokens < pin_tokens)
+                pin_tokens = req->pin_kv_prefix_tokens;
+            int full_blocks = pin_tokens / kv_manager_->kv_cache()->block_size();
+            if (full_blocks > 0)
+                kv_manager_->pin_prefix(req->id, full_blocks);
+        }
+    }
+    kv_manager_->free_sequence(req->id);
+    release_recurrent_slot_(req->id);
+    req->recurrent_restore.reset();  // release the snapshot buffer for recycling
+    spec_suffix_idx_.erase(req->id);
+    if (req->constraints)
+        constraints_return_(std::move(req->constraints));
+    // Server visibility: the engine outlives requests, so cumulative
+    // speculation telemetry is logged per request end (no-op when idle).
+    if (spec_ngram_enabled_(*req))
+        log_spec_stats_();
+}
+
+void Engine::score_capture_(Request& req, const Tensor& logits, cudaStream_t stream) {
+    if (req.score_token_ids.empty() || logits.data == nullptr)
+        return;
+    // logits is [n_rows, vocab]; a cross-encoder's verdict lives at the LAST
+    // position, which is the row the sampler would have used.
+    const int64_t n_rows = logits.ndim >= 2 ? logits.shape[0] : 1;
+    const int64_t vocab = logits.ndim >= 2 ? logits.shape[1] : logits.shape[0];
+    const float* last_row = static_cast<const float*>(logits.data) +
+                            static_cast<size_t>(n_rows - 1) * static_cast<size_t>(vocab);
+    req.score_out.assign(req.score_token_ids.size(), 0.0f);
+    // One D2H per id: the ids are a handful (yes/no), so a full-row copy would
+    // move 600 KB to read 8 bytes.
+    for (size_t i = 0; i < req.score_token_ids.size(); i++) {
+        const int32_t id = req.score_token_ids[i];
+        if (id < 0 || id >= static_cast<int32_t>(vocab))
+            continue;
+        QUENCH_CUDA_CHECK_LOG(
+            cudaMemcpyAsync(&req.score_out[i], last_row + id, sizeof(float), cudaMemcpyDeviceToHost, stream));
+    }
+    QUENCH_CUDA_CHECK_LOG(cudaStreamSynchronize(stream));
+}
+
+void Engine::embed_accumulate_chunk_(Request& req, int chunk_len, cudaStream_t stream) {
+    const int d_model = static_cast<int>(model_->config().d_model);
+    if (!d_embed_pool_scratch_) {
+        d_embed_pool_scratch_ = static_cast<float*>(
+            vram_alloc_.allocate(static_cast<size_t>(d_model) * sizeof(float), "embed_pool_scratch"));
+        if (!d_embed_pool_scratch_) {
+            QUENCH_LOG_ERROR("VRAMAllocator failed for embed pool scratch (%d floats)", d_model);
+            return;
+        }
+    }
+    executor_->pool_hidden_sum(chunk_len, d_embed_pool_scratch_, stream);
+    std::vector<float> partial(d_model);
+    QUENCH_CUDA_CHECK_LOG(cudaMemcpyAsync(partial.data(), d_embed_pool_scratch_,
+                                       static_cast<size_t>(d_model) * sizeof(float), cudaMemcpyDeviceToHost,
+                                       stream));
+    QUENCH_CUDA_CHECK_LOG(cudaStreamSynchronize(stream));
+    if (req.embedding_out.empty())
+        req.embedding_out.assign(d_model, 0.0f);
+    for (int d = 0; d < d_model; d++)
+        req.embedding_out[d] += partial[d];
+}
+
+void Engine::ensure_constraints_(const std::shared_ptr<Request>& req) {
+    const bool tool_enforced = !req->tool_constraint_tools.empty();
+    const bool regex_enforced = !req->regex_pattern.empty();
+    const bool grammar_enforced = !req->grammar.empty();
+    if (!(req->json_mode || !req->json_schema.empty() || tool_enforced || regex_enforced ||
+          grammar_enforced) ||
+        req->constraints)
+        return;
+
+    // Pool key: tool-enforced requests key by their tool-call signature so a
+    // pooled manager with the same classified tables is reused.
+    // A regex or grammar request keys by its source, so a pooled manager that
+    // already classified that vocabulary is reused.
+    const std::string pool_key_regex = regex_enforced ? ("regex:" + req->regex_pattern) : std::string();
+    const std::string pool_key_grammar = grammar_enforced ? ("gbnf:" + req->grammar) : std::string();
+    const std::string pool_key = tool_enforced ? ConstraintManager::tool_call_key(req->tool_constraint_tools,
+                                                                                  req->tool_envelope_open,
+                                                                                  req->tool_envelope_close,
+                                                                                  req->tool_constraint_xml)
+                                 : regex_enforced   ? pool_key_regex
+                                 : grammar_enforced ? pool_key_grammar
+                                                    : req->json_schema;
+    req->constraints = constraints_checkout_(pool_key);
+
+    bool enforced = false;
+    if (tool_enforced)
+        enforced = req->constraints->prepare_tool_call(req->tool_constraint_tools, req->tool_envelope_open,
+                                                       req->tool_envelope_close, model_->tokenizer(),
+                                                       /*thinking_open=*/req->in_think_block,
+                                                       req->tool_constraint_optional, req->tpl_family,
+                                                       req->tool_constraint_parallel,
+                                                       req->tool_constraint_bare_args,
+                                                       req->tool_constraint_xml);
+    if (!enforced && regex_enforced)
+        enforced = req->constraints->prepare_regex(req->regex_pattern, model_->tokenizer(),
+                                                   /*thinking_open=*/req->in_think_block);
+    if (!enforced && grammar_enforced)
+        enforced = req->constraints->prepare_grammar(req->grammar, model_->tokenizer(),
+                                                     /*thinking_open=*/req->in_think_block);
+    if (!enforced && (req->json_mode || !req->json_schema.empty()))
+        req->constraints->prepare(req->json_mode, req->json_schema, model_->tokenizer(), req->has_tools,
+                                  req->tpl_family, /*thinking_open=*/req->in_think_block);
+}
+
+std::shared_ptr<ConstraintManager> Engine::constraints_checkout_(const std::string& json_schema) {
+    // Prefer a pooled manager that already classified this schema or grammar
+    // (the key is the schema string, or "gbnf:" + the grammar source).
+    if (!json_schema.empty()) {
+        for (auto it = constraint_pool_.begin(); it != constraint_pool_.end(); ++it) {
+            const std::string& cached_gbnf = (*it)->cached_grammar();
+            if ((*it)->cached_schema() == json_schema ||
+                (!cached_gbnf.empty() && json_schema == "gbnf:" + cached_gbnf)) {
+                auto cm = std::move(*it);
+                constraint_pool_.erase(it);
+                return cm;
+            }
+        }
+    }
+    if (!constraint_pool_.empty()) {
+        auto cm = std::move(constraint_pool_.back());
+        constraint_pool_.pop_back();
+        return cm;
+    }
+    return std::make_shared<ConstraintManager>();
+}
+
+void Engine::constraints_return_(std::shared_ptr<ConstraintManager> cm) {
+    if (!cm)
+        return;
+    cm->reset();
+    constexpr size_t kMaxConstraintPool = 8;
+    if (constraint_pool_.size() < kMaxConstraintPool)
+        constraint_pool_.push_back(std::move(cm));
+}
+
+// =====================================================================
+// Vision delegation
+// =====================================================================
+
+
+
+
+bool Engine::preprocess_image(const uint8_t* data, size_t len, ImageData& out) {
+    return vision_.preprocess(data, len, out);
+}
+
+
+// =====================================================================
+// Initialization — decomposed into sub-phases
+// =====================================================================
+//
+// The init_apply_debug_raw_overrides_ / init_resolve_kv_dtype_policy_ /
+// init_resolve_ssm_dtype_ / init_resolve_fp8_prefill_ /
+// init_resolve_quant_flags_ / init_compute_max_seq_len_ methods (~320 LOC
+// across 6 methods) live in runtime/engine_init_resolver.cpp.
+
+bool Engine::init(std::shared_ptr<Model> model, const EngineConfig& config) {
+    if (!model)
+        return false;
+
+    // A previous engine on this same model handle freed the model's source
+    // weight tensors to reclaim VRAM (Phase-4b drop); their .data pointers are
+    // dangling now, so rebuilding this engine's weight caches would read freed
+    // memory and poison the CUDA context with an illegal access. Reject
+    // up front with a clear error. Reload the model for a second engine. (Dense
+    // models that never drop sources are unaffected — create/free/create works.)
+    if (model->sources_consumed()) {
+        QUENCH_LOG_ERROR(
+            "Engine::init: this model handle was already bound to an engine whose "
+            "weight caches consumed (freed) the model's source tensors — a second "
+            "engine cannot be built on it. Reload the model (quench_model_load) to "
+            "create another engine.");
+        return false;
+    }
+
+    model_ = std::move(model);
+    config_ = config;
+
+    // Phase 5 Track D (follow-up): take the pending RuntimeConfig stashed
+    // by tool main (quench-cli / quench-server) via set_pending_runtime_config().
+    // If no pending config was set (library/test embeddings), this returns
+    // a freshly loaded env-seeded default. Either way, every Engine::*
+    // method reads runtime_config_ directly from here on; engine_init_
+    // resolver_ helpers mutate this snapshot in place for arch-specific
+    // defaults.
+    runtime_config_ = take_pending_runtime_config();
+
+    // Bridge the documented quench.conf [server]/[paths] keys into the live
+    // EngineConfig. These keys are user-facing (quench.conf.example) but were
+    // parsed into RuntimeConfig and never read — the live path flowed only
+    // through the C-API/CLI, so setting them in quench.conf was silently inert
+    // (the wiring PR intended for [server] prefix_cache regressed in a
+    // later refactor). quench.conf is the user's persistent preference; a CLI
+    // flag / C-API value can additionally ENABLE a knob (OR), so a library
+    // embedder's explicit choice is never clobbered. --mmproj (explicit
+    // one-shot) overrides quench.conf. RuntimeConfig defaults for these match the
+    // EngineConfig defaults (off), so no-quench.conf embedders are unaffected.
+    config_.use_prefix_caching = config_.use_prefix_caching || runtime_config_.server.prefix_cache;
+    config_.use_green_contexts = config_.use_green_contexts || runtime_config_.server.green_contexts;
+    if (config_.prefix_pin_budget_pct == 25)  // EngineConfig default untouched → take quench.conf
+        config_.prefix_pin_budget_pct = runtime_config_.server.prefix_pin_budget_pct;
+    if (config_.mmproj_path.empty())
+        config_.mmproj_path = runtime_config_.paths.mmproj;
+    if (config_.vram_budget_mb == 0 && runtime_config_.runtime.vram_budget_mb > 0)
+        config_.vram_budget_mb = static_cast<size_t>(runtime_config_.runtime.vram_budget_mb);
+    if (config_.kv_fraction == 0.8f)  // EngineConfig default untouched → take quench.conf
+        config_.kv_fraction = runtime_config_.vram.kv_fraction;
+    if (config_.vram_reserve_floor_pct == 10)
+        config_.vram_reserve_floor_pct = runtime_config_.vram.reserve_floor_pct;
+    if (config_.library_reserve_mb < 0)
+        config_.library_reserve_mb = runtime_config_.vram.library_reserve_mb;
+    if (config_.kv_cache_max_blocks == 0 && runtime_config_.kv_cache.max_blocks > 0)
+        config_.kv_cache_max_blocks = runtime_config_.kv_cache.max_blocks;
+
+    // Install the process-wide VRAM budget view BEFORE any sizing runs —
+    // every cudaMemGetInfo-based decision below (weight upload gates, cache
+    // budgets, KV clamp, workspaces) reads through vram_budget_mem_get_info.
+    vram_budget_install(config_.vram_budget_mb);
+
+    // Publish THIS engine's RuntimeConfig to the process_diag snapshot that the
+    // leaf kernels read. Until this only ever ran in the tool mains
+    // (quench-cli / quench-server), so a C-API embedding got the *default* value for
+    // all 28 mirrored flags while exec/ read the engine's own RuntimeConfig —
+    // same config, different kernels. attention.fa2_hd256 was the sharp case:
+    // exec/ decides whether to attempt FA2 (and whether to size the S-matrix
+    // workspace) from runtime_config_, while the kernel accepts hd=256 based on
+    // process_diag_fa2_hd256(); with the two disagreeing, the FMHA chain can walk
+    // down to the throw.
+    //
+    // Ordering matters twice over:
+    //   - BEFORE the arch resolvers below. install() writes gemm.cublas_fp16_acc
+    //     ("auto" → off) and runtime.deterministic_gemm verbatim; the resolvers
+    //     then promote both via their setters. Installing after them would undo
+    //     the arch-specific decisions.
+    //   - BEFORE the true-promotion of the deterministic gate, which must stay
+    //     after install() so [runtime] deterministic still implies
+    //     deterministic_gemm (install copies only the latter field).
+    process_diag_install(runtime_config_);
+
+    // The deterministic kernel gate lives in process_diag (compute kernels read
+    // process_diag_deterministic_gemm()). [runtime] deterministic implies it,
+    // but install() above copies only [runtime] deterministic_gemm, so promote
+    // here. True-promotion only — arch resolvers may already have set it.
+    if (runtime_config_.runtime.deterministic || runtime_config_.runtime.deterministic_gemm)
+        process_diag_set_deterministic_gemm(true);
+
+    // D1: derive the architecture profile ONCE, before the resolvers below that
+    // currently re-derive GDN/SSM/MoE classification inline. The layers are
+    // loaded by now (the resolvers read layer().gdn_gate.data directly).
+    model_->build_profile();
+    {
+        const auto& mp = model_->profile();
+        const char* av = nullptr;
+        switch (mp.attn_variant) {
+            case ModelProfile::AttnVariant::GEMMA4_SWA:
+                av = "gemma4_swa";
+                break;
+            case ModelProfile::AttnVariant::GPTOSS_SWA:
+                av = "gptoss_swa";
+                break;
+            case ModelProfile::AttnVariant::NOPE:
+                av = "nope";
+                break;
+            case ModelProfile::AttnVariant::MLA:
+                av = "mla";
+                break;
+            case ModelProfile::AttnVariant::STANDARD:
+                av = "standard";
+                break;
+        }
+        QUENCH_LOG_INFO("ModelProfile: moe=%d gdn=%d ssm=%d hybrid=%d dense=%d attn=%s", mp.is_moe, mp.is_gdn,
+                     mp.is_ssm, mp.is_hybrid, mp.is_dense, av);
+    }
+
+    init_apply_debug_raw_overrides_();
+    init_apply_rope_override_();
+    init_resolve_kv_dtype_policy_();
+    init_resolve_ssm_dtype_();
+    init_resolve_fp8_prefill_();
+    init_resolve_quant_flags_();
+
+    init_compute_max_seq_len_();
+
+    // --- Core initialization ---
+    // Phase-0 VRAM audit harness: lifecycle checkpoints bracket each init
+    // sub-phase so the device free-VRAM delta measures that phase's cost with
+    // full coverage (raw cudaMalloc included). Gated, default off.
+    if (runtime_config_.diagnostics.vram_audit) {
+        MemAccount::instance().set_enabled(true);
+        if (!runtime_config_.diagnostics.vram_audit_dump.empty())
+            MemAccount::instance().set_dump_path(runtime_config_.diagnostics.vram_audit_dump);
+    }
+    MemAccount::instance().checkpoint("00_pre_init");
+    // Everything already resident before quench allocates anything: CUDA primary
+    // context + driver. Measured, not assumed — it is 1679.6 MiB on this
+    // WSL2/WDDM box and it is not quench's memory.
+    size_t ctx_baseline_bytes = 0;
+    {
+        size_t f = 0, tot = 0;
+        if (vram_budget_mem_get_info(&f, &tot))
+            ctx_baseline_bytes = tot > f ? tot - f : 0;
+    }
+
+    // 5% headroom (was 10%) — MoE models (30B Q6_K) need every MiB on 32GB.
+    // WSL2/WDDM has ~500 MiB driver overhead, 5% of 32GB = 1.6 GB covers it.
+    if (!vram_alloc_.init(kAllocatorHeadroomPct / 100.0f)) {
+        QUENCH_LOG_ERROR("Failed to initialize VRAM allocator");
+        return false;
+    }
+    // Engine-persistent (T2) arena — opened before the first tenant
+    // (docs/MEMORY_ARCHITECTURE.md A3.3). The arena acquires its Region HERE,
+    // so its capacity is what reserves those bytes against everything that
+    // allocates later — notably the pre-dequant cache build, which expands
+    // into whatever free VRAM it finds. Size it from the exact
+    // per-tenant demand rather than a constant; the constant is only a floor
+    // for the tenants not migrated yet.
+    {
+        // capture_ctx_cap mirrors engine_spec_capture.cpp: the chunk-capture
+        // scratch is sized from min(the configured cap, max_seq_len), and is
+        // charged only when speculation can actually take that path.
+        const int capture_cap = runtime_config_.speculative.capture
+                                    ? (config_.max_seq_len > 0
+                                           ? std::min(runtime_config_.speculative.capture_ctx_cap,
+                                                      config_.max_seq_len)
+                                           : runtime_config_.speculative.capture_ctx_cap)
+                                    : 0;
+        const auto d = exec_t2_demand(*model_, config_.max_seq_len, config_.max_batch_size,
+                                      config_.use_fp8_prefill, runtime_config_.attention.mla_absorb,
+                                      capture_cap);
+        // The Qwen3-VL tower is engine-lifetime and an arena tenant, but it uploads
+        // during warmup — long after this point — so its demand has to be read off
+        // the model's shapes here or the arena is sized without it. Gemma's mmproj
+        // tower is a separate file that is not loaded yet and stays outside the
+        // arena for now.
+        size_t vision_bytes =
+            model_->vision_tower ? qwen3vl_vision_arena_bytes(*model_->vision_tower,
+                                                              runtime_config_.runtime.vision_max_patches)
+                                 : 0;
+        if (!config_.mmproj_path.empty())
+            vision_bytes += vision_mmproj_arena_bytes(config_.mmproj_path, model_->config_.d_model);
+        // The decode batch pool is engine-lifetime and config-sized, but allocated
+        // after KV sizing, so reserve for it here. with_swa_tables is a KV-init
+        // decision not known yet; assume it — the pool is a few hundred KiB, so
+        // guessing high costs nothing and guessing low would exhaust the arena.
+        const int kv_bs = config_.kv_block_size > 0 ? config_.kv_block_size : 16;
+        const size_t batch_pool_bytes = GPUBatchPool::demand_bytes(
+            config_.max_batch_size, (config_.max_seq_len + kv_bs - 1) / kv_bs, /*with_swa_tables=*/true);
+        // *9/8 for 256-byte alignment padding across the arena's takes (integer
+        // identical to t + t/8, just one expression instead of two).
+        const size_t cap = std::max(kEngineArenaDefaultBytes, (d.total() + vision_bytes + batch_pool_bytes) * 9 / 8);
+        QUENCH_LOG_INFO("engine arena demand: %s + vision %.1f + batchpool %.2f MiB -> %.1f MiB reserved",
+                     d.describe().c_str(), vision_bytes / (1024.0 * 1024.0),
+                     batch_pool_bytes / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
+        (void)engine_arena_open(cuda_malloc_backend(), cap);
+        // Name the two charges that are already known, HERE rather than after
+        // warmup. Both are facts by now — the context was measured above, the
+        // arena just took its region — and naming them early is what lets
+        // MemAccount::unattributed_bytes() mean "what quench cannot account for"
+        // during init instead of "context + arena + that". The
+        // library figure is filled in after warmup measures it.
+        MemAccount::instance().set_named_charges(ctx_baseline_bytes, /*library=*/0, engine_arena().capacity(),
+                                                 engine_arena().high_water());
+    }
+    // T2 slot pool for the conditional graph loop (A7 step 5.3).
+    graph_slot_pool_open_for(cuda_malloc_backend(), config_.max_seq_len);
+    gemm_init();
+    attention_cublas_prewarm();
+    // The grouped-3x prewarm takes the CUTLASS staging + workspace slices from
+    // the T2 arena so the grouped NVFP4 GEMM never has to grow one mid-capture.
+    // It is gated on the model, not just on
+    // cutlass_grouped_3x_nvfp4_available() — an sm_120 *capability* query, not
+    // a model one. Every entry point into that GEMM lives in
+    // exec/executor_forward_moe*.cu, so a model without experts cannot reach
+    // it and must not pay for a path it never takes. What it takes is
+    // ~2 MiB: the workspace half is sized to
+    // a measured 152 320 B, not guessed.
+    // IMMA prefill scratch (A7 step 8): take it at the charged
+    // bound now rather than letting the GEMM climb a staircase of takes later —
+    // each intermediate one is stranded, a bump arena having no free.
+    {
+        const auto imma = exec_imma_scratch_shape(*model_, config_.max_seq_len);
+        mmq_q8_imma_preallocate(imma.rows, imma.k);
+    }
+    if (model_->profile().is_moe) {
+        gemm_grouped_3x_nvfp4_prewarm();
+    } else {
+        QUENCH_LOG_INFO("grouped-3x NVFP4 prewarm skipped: model has no experts");
+    }
+    scheduler_ = std::make_unique<Scheduler>(config_.max_batch_size);
+    (void)stream_.create(cudaStreamNonBlocking);
+    MemAccount::instance().checkpoint("01_prewarm_gemm");
+
+    // --- Encoder-only embedder: no executor, KV cache, decoder
+    // features, or warmup. Upload weights, dequant them into the dedicated
+    // encoder workspace, done — /v1/embeddings drives encoder_embed().
+    if (model_->profile().is_encoder) {
+        if (!model_->upload_weights_gpu(config_.compute_dtype, stream_, 1ULL << 30)) {
+            QUENCH_LOG_ERROR("encoder: weight upload failed");
+            return false;
+        }
+        auto* ews = new quench::EncoderWorkspace();
+        int cap = model_->config_.max_seq_len > 0 ? model_->config_.max_seq_len : 2048;
+        if (config_.max_seq_len > 0)
+            cap = std::min(cap, config_.max_seq_len);
+        if (!quench::encoder_workspace_init(*ews, *model_, cap, stream_)) {
+            delete ews;
+            return false;
+        }
+        encoder_ws_storage_ = ews;
+        QUENCH_LOG_INFO("Encoder embedder ready (arch=%s, max_tokens=%d, d=%d)",
+                     model_arch_name(model_->config_.arch), cap, model_->config_.d_model);
+        return true;
+    }
+
+    // --- Sub-phases ---
+    // Everything from here to the end of warmup is expected to allocate.
+    set_alloc_phase(AllocPhase::Planning);
+    if (!init_weights()) {
+        return false;
+    }
+    MemAccount::instance().checkpoint("02_weights+decode_cache");
+    if (!init_kv_cache()) {
+        return false;
+    }
+    MemAccount::instance().checkpoint("03_kv_cache");
+    if (!init_features())
+        return false;
+    MemAccount::instance().checkpoint("04_features");
+    if (!runtime_config_.runtime.warmup) {
+        QUENCH_LOG_INFO("Warmup SKIPPED (runtime.warmup=false)");
+    } else {
+        warmup();
+    }
+    // Last thing before the guard arms: the speculative verify path's one-shot
+    // capacity resolutions (A7 step 5.4), which otherwise land mid-serving.
+    prewarm_spec_scratch_();
+    MemAccount::instance().checkpoint("05_post_warmup");
+
+    // I2: from here on, asking the driver for memory is a defect
+    // (docs/MEMORY_ARCHITECTURE.md A3.2). Connecting the guard HERE is what
+    // gives steady_state_allocations() its meaning — a guard that is
+    // never armed is structurally zero and asserts
+    // nothing. Debug builds abort on a
+    // serving-phase acquisition; release builds count it per tag and log
+    // once, because a production server must not die over an accounting bug.
+    set_alloc_phase(AllocPhase::Serving);
+    // Arm the CUDA-side watermarks too: the phase guard only sees Backend
+    // traffic, these see every cudaMallocAsync and every graph-owned
+    // allocation regardless of who made it.
+    MemAccount::instance().arm_steady_state_watermarks();
+    // Start the device-used peak sampler so the prefill activation / score
+    // matrix spike during the workload is captured, then dump the init table.
+    // Report the library reserve the first forward ACTUALLY claimed, not the
+    // constant the plan had to guess with. The plan needs the
+    // figure before the forward that produces it, so it cannot use this — but
+    // the audit table runs after warmup and has no reason to keep guessing.
+    // Measured on Qwen3-8B this is the difference between 82.5 % and 98.3 %
+    // accounted, i.e. criterion 6 met instead of missed, with no config change.
+    // Falls back to the charged value when warmup was skipped (MXFP4, Gemma-4).
+    MemAccount::instance().set_named_charges(ctx_baseline_bytes,
+                                             measured_library_reserve_ != SIZE_MAX
+                                                 ? measured_library_reserve_
+                                                 : engine_internal::library_reserve_charge(
+                                                       runtime_config_.vram.library_reserve_mb),
+                                             engine_arena().capacity(), engine_arena().high_water());
+    MemAccount::instance().sampler_start(2000);
+    MemAccount::instance().report("init_complete");
+
+    return true;
+}
+
+// =====================================================================
+// generate()
+// =====================================================================
+
+std::string Engine::generate(const std::string& prompt, int max_tokens, float temperature, float top_p,
+                             int top_k, int seed, bool apply_chat_template, float min_p,
+                             float repetition_penalty, float frequency_penalty, float presence_penalty) {
+    Tokenizer* tok = model_->tokenizer();
+    if (!tok) {
+        return "";
+    }
+
+    std::vector<int32_t> tokens;
+
+    if (apply_chat_template && !chat_template_.is_raw()) {
+        std::vector<ChatMessage> messages = {{"user", prompt}};
+        if (vision_.has_input() && vision_.is_available()) {
+            tokens = chat_template_.apply_with_image(*tok, messages, vision_.num_image_tokens());
+        } else {
+            tokens = chat_template_.apply(*tok, messages);
+        }
+        QUENCH_LOG_INFO("Applied %s chat template (%zu tokens%s)",
+                     chat_template_family_name(chat_template_.family()), tokens.size(),
+                     vision_.has_input() ? ", with image" : "");
+    } else {
+        tokens = tok->encode(prompt);
+        if (tok->add_bos() && (tokens.empty() || tokens[0] != tok->bos_id())) {
+            tokens.insert(tokens.begin(), static_cast<int32_t>(tok->bos_id()));
+        }
+    }
+
+    QUENCH_LOG_INFO("Encoded %zu tokens", tokens.size());
+    {
+        std::string dump;
+        for (size_t i = 0; i < tokens.size() && i < 64; ++i) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%d", tokens[i]);
+            dump += buf;
+            if (i + 1 < tokens.size())
+                dump += ", ";
+        }
+        if (tokens.size() > 64)
+            dump += "...";
+        QUENCH_LOG_INFO("Token IDs: [%s]", dump.c_str());
+    }
+
+    auto req = std::make_shared<Request>();
+    req->id = next_request_id_++;
+    req->input_tokens = std::move(tokens);
+    req->max_tokens = max_tokens;
+    req->temperature = temperature;
+    req->top_p = top_p;
+    req->top_k = top_k;
+    req->seed = seed;
+    req->min_p = min_p;
+    req->repetition_penalty = repetition_penalty;
+    req->frequency_penalty = frequency_penalty;
+    req->presence_penalty = presence_penalty;
+    req->status = RequestStatus::PENDING;
+
+    scheduler_->add_request(req);
+
+    // Prefill
+    while (req->status == RequestStatus::PENDING || req->status == RequestStatus::PREFILLING) {
+        bool has_work = step();
+        if (!has_work)
+            break;
+    }
+
+    // Decode — try conditional graph loop, fall back to step()
+    // Think budget is now enforced device-side in post_decode_step_kernel.
+    // Penalties are applied device-side via apply_penalties_device_count in the graph loop.
+    if (req->status == RequestStatus::DECODING && !req->output_tokens.empty() && config_.use_cuda_graphs &&
+        !offload_mgr_) {
+        int32_t first_token = req->output_tokens.back();
+        auto graph_tokens = try_graph_loop_decode(req, first_token, decode_stream());
+        if (!graph_tokens.empty()) {
+            int32_t last = graph_tokens.back();
+            // Track think state through all graph tokens
+            for (int32_t t : graph_tokens)
+                track_think_state(*req, t);
+            bool hit_stop = should_stop(*req, last);
+            if (hit_stop)
+                graph_tokens.pop_back();
+
+            for (int32_t t : graph_tokens) {
+                req->output_tokens.push_back(t);
+            }
+
+            bool done = hit_stop || static_cast<int>(req->output_tokens.size()) >= req->max_tokens;
+            if (done) {
+                req->status = RequestStatus::FINISHED;
+                kv_manager_->free_sequence(req->id);
+            }
+        }
+    }
+
+    // Fallback — per-step decode
+    while (req->status != RequestStatus::FINISHED && req->status != RequestStatus::CANCELLED) {
+        bool has_work = step();
+        if (!has_work && req->status != RequestStatus::FINISHED && req->status != RequestStatus::CANCELLED) {
+            break;
+        }
+    }
+
+    if (req->output_tokens.empty()) {
+        return "";
+    }
+
+    vision_.clear_image();
+
+    std::string result = tok->decode(req->output_tokens);
+    return result;
+}
+
+// prepare_graph_loop: moved to engine_speculative.cpp
+// build_graph_config: moved to engine_speculative.cpp
+// try_graph_loop_decode: moved to engine_speculative.cpp
+// try_launch_async_graph_loop: moved to engine_speculative.cpp
+
+void Engine::add_request(std::shared_ptr<Request> req) {
+    if (scheduler_) {
+        req->id = next_request_id_++;
+        // Initialize in_think_block from the prompt tail. Chat templates for
+        // Qwen3 / Qwen3.5 / Qwen3.6 / DeepSeek-R1 inject `<think>\n` via
+        // add_generation_prompt by default — without seeding the flag here,
+        // a model that promptly closes its empty thinking block will hit
+        // should_stop with in_think_block=false on the trailing im_end and
+        // produce a 0-content completion. We scan the decoded text of the
+        // last few input tokens (covers both single-id and BPE multi-token
+        // forms) and look for whichever marker appears last.
+        Tokenizer* ptok = model_ ? model_->tokenizer() : nullptr;
+        if (ptok && !req->input_tokens.empty()) {
+            constexpr int kTailScan = 16;  // covers worst case BPE split + slack
+            int n = static_cast<int>(req->input_tokens.size());
+            int start = std::max(0, n - kTailScan);
+            std::string tail_text;
+            for (int i = start; i < n; ++i) {
+                tail_text += ptok->decode_token(req->input_tokens[i]);
+            }
+            size_t open_pos = tail_text.rfind("<think>");
+            size_t close_pos = tail_text.rfind("</think>");
+            // </think> shares a suffix with <think>, so resolve precedence:
+            // open is "later" only if it appears AFTER any close.
+            bool open_is_last = (open_pos != std::string::npos) &&
+                                (close_pos == std::string::npos || open_pos > close_pos + 1);
+            if (open_is_last) {
+                req->in_think_block = true;
+            }
+        }
+        // gpt-oss Harmony generation starts in the analysis (reasoning) channel
+        // — the model emits <|channel|>analysis<|message|> as its first output,
+        // there is no <think> opener for the scan above to find. Seed the think
+        // state so the answer-headroom budget counts reasoning from the start
+        // and force-closes the analysis channel (<|end|>) before max_tokens is
+        // exhausted, instead of returning an empty final channel.
+        if (harmony_reasoning_) {
+            req->started_in_think = true;
+            req->in_think_block = true;
+        }
+        scheduler_->add_request(std::move(req));
+    }
+}
+
+}  // namespace quench

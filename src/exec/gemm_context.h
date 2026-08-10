@@ -1,0 +1,104 @@
+#pragma once
+
+#include "exec/quant_scratch.h"
+#include "core/dispatch_policy.h"
+#include <cuda_runtime.h>
+
+namespace quench {
+
+struct WeightCaches;  // defined in executor.h
+
+// ---------------------------------------------------------------------------
+// GemmContext: bundles all state needed by gemm_dispatch into a single struct.
+//
+// Replaces 21 loose parameters with one context object. Created once per
+// forward pass step (or per layer), passed to all GEMM dispatch calls.
+// All members are non-owning references — lifetime managed by GraphExecutor.
+// ---------------------------------------------------------------------------
+struct GemmContext {
+    cudaStream_t stream = nullptr;
+
+    // Output mode: 0.0 = overwrite (C = A@B), 1.0 = residual add (C += A@B)
+    float beta = 0.0f;
+
+    // Weight caches (non-owning)
+    const WeightCaches* wcache = nullptr;
+    bool force_fp16 = false;
+
+    // Per-model override: when set, the GGUF small-M dispatch path prefers
+    // the mmvq backend over dp4a for eligible qtypes. Sourced from
+    // ModelConfig::Overrides::Gemma4::force_mmvq. Defaults
+    // to false so non-Gemma-4 models behave identically.
+    bool force_mmvq = false;
+
+    // Per-Engine knobs (instead of a RuntimeConfig::current() singleton read
+    // in the gemm_dispatch / gemm_kernel_gguf hot paths).
+    // Wired by the executor's GemmContext::make caller from runtime_config().
+    bool q4k_hmma_enabled = false;
+    bool q8_imma_enabled = false;
+    bool q4k_imma_prefill = false;
+    bool gemm_no_mmvq = false;
+    bool gemm_no_mmvq_q8_0 = false;
+    bool gemm_no_dp4a_gemv = false;
+
+    // Spec-verify chunk forward: small-M GEMMs (M <= largest capture
+    // bucket) prefer the NVFP4 decode overlay over the M>1 prefill dequant
+    // path. Set from InferenceState::spec_verify_chunk gated on
+    // speculative.verify_nvfp4_gemm; never set for real prefills, so prompt
+    // processing quality is unaffected.
+    bool spec_verify_small_m = false;
+
+    // Quantization scratch buffers (non-owning)
+    const QuantScratch* qscratch = nullptr;
+
+    // Helper: create from executor state. `rcfg` is the per-Engine RuntimeConfig
+    // — its gemm.* flags are mirrored into the context once at construction
+    // (replaces the former RuntimeConfig::current() reads in gemm_dispatch
+    // and gemm_kernel_gguf).
+    static GemmContext make(cudaStream_t s, const WeightCaches& wc, const QuantScratch& qs,
+                            const DispatchPolicy& rcfg, bool force_fp16 = false, bool force_mmvq = false,
+                            bool spec_verify = false) {
+        GemmContext ctx;
+        ctx.stream = s;
+        ctx.wcache = &wc;
+        ctx.qscratch = &qs;
+        ctx.force_fp16 = force_fp16;
+        ctx.force_mmvq = force_mmvq;
+        ctx.q4k_hmma_enabled = rcfg.gemm.q4k_hmma_enabled;
+        ctx.q8_imma_enabled = rcfg.gemm.q8_imma_enabled;
+        ctx.q4k_imma_prefill = rcfg.gemm.q4k_imma_prefill;
+        ctx.gemm_no_mmvq = rcfg.gemm.no_mmvq;
+        ctx.gemm_no_mmvq_q8_0 = rcfg.gemm.no_mmvq_q8_0;
+        ctx.gemm_no_dp4a_gemv = rcfg.gemm.no_dp4a_gemv;
+        ctx.spec_verify_small_m = spec_verify && rcfg.speculative.verify_nvfp4_gemm;
+        return ctx;
+    }
+
+    // Convenience: set beta for residual-add pattern
+    GemmContext with_beta(float b) const {
+        GemmContext c = *this;
+        c.beta = b;
+        return c;
+    }
+
+    // Act-quant hint (NVFP4 prefill QKV / gate-up dedupe): the CUTLASS NVFP4
+    // activation scratch already holds quantize(input) for exactly this
+    // (data, M, K) triple — a prior dispatch on the SAME input quantized it.
+    // gemm_via_handle_ forwards the match as args.act_prequantized so the
+    // handler skips its quantize step. Scoped per call site (QKV, gate/up);
+    // never cached across ops — the scratch is clobbered by the next
+    // dispatch on a different input.
+    const void* act_quant_hint_data = nullptr;
+    int act_quant_hint_m = 0;
+    int act_quant_hint_k = 0;
+
+    GemmContext with_act_quant_hint(const void* data, int m, int k) const {
+        GemmContext c = *this;
+        c.act_quant_hint_data = data;
+        c.act_quant_hint_m = m;
+        c.act_quant_hint_k = k;
+        return c;
+    }
+};
+
+}  // namespace quench

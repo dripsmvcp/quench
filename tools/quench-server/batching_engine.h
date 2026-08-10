@@ -1,0 +1,142 @@
+#pragma once
+
+#include "runtime/engine.h"
+#include "runtime/request.h"
+#include "api/quench_internal.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+// Token delivered from the worker thread to the HTTP handler.
+struct TokenEvent {
+    int32_t token_id;
+    bool is_last;               // true if this is the final delivery (request done)
+    const char* finish_reason;  // non-null on last token: "stop", "length", "cancelled"
+};
+
+// A server-level request submitted to the batching engine.
+// Wraps an quench::Request and adds a token queue for the HTTP handler to read.
+struct ServerRequest {
+    std::shared_ptr<quench::Request> request;
+
+    // Token queue: worker pushes, HTTP handler pops.
+    // Protected by token_mutex / token_cv.
+    std::mutex token_mutex;
+    std::condition_variable token_cv;
+    std::deque<TokenEvent> token_queue;
+    std::atomic<bool> cancelled{false};  // set by HTTP handler to cancel
+
+    // Track how many output tokens we have already delivered
+    size_t notified_count = 0;
+
+    // Push a token event (called from worker thread)
+    void push_token(int32_t token_id, bool is_last, const char* reason) {
+        std::lock_guard<std::mutex> lock(token_mutex);
+        token_queue.push_back({token_id, is_last, reason});
+        token_cv.notify_one();
+    }
+
+    // Push a completion event with no token (called from worker thread)
+    void push_finish(const char* reason) {
+        std::lock_guard<std::mutex> lock(token_mutex);
+        token_queue.push_back({-1, true, reason});
+        token_cv.notify_one();
+    }
+
+    // Pop next token event, blocking until available or timeout.
+    // Returns false on timeout (caller should check client disconnect).
+    bool pop_token(TokenEvent& out, int timeout_ms = 500) {
+        std::unique_lock<std::mutex> lock(token_mutex);
+        if (!token_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                               [this] { return !token_queue.empty(); })) {
+            return false;  // timeout — caller should check is_writable
+        }
+        out = token_queue.front();
+        token_queue.pop_front();
+        return true;
+    }
+
+    // Cancel the request (called from HTTP handler if client disconnects)
+    void cancel() { cancelled.store(true, std::memory_order_release); }
+
+    bool is_cancelled() const { return cancelled.load(std::memory_order_acquire); }
+};
+
+// Continuous batching engine that runs inference in a background thread.
+// HTTP handlers submit ServerRequest objects; the worker thread runs the
+// engine step loop, processing multiple requests simultaneously via the
+// scheduler.
+class BatchingEngine {
+public:
+    BatchingEngine() = default;
+    ~BatchingEngine();
+
+    // Initialize with an existing QuenchContext (takes non-owning reference).
+    // Starts the background worker thread.
+    void start(QuenchContext ctx);
+
+    // Stop the background worker thread. Must be called before destroying
+    // the QuenchContext. Waits for the worker to finish. Cancels any in-flight
+    // requests — use pause()/resume() instead when the generations must
+    // survive (e.g. embeddings/vision exclusive-access windows).
+    void stop();
+
+    // Graceful exclusive-access handshake. pause() lets the worker FINISH all
+    // in-flight requests (it never cancels them), then parks the worker thread
+    // so the caller can drive engine->step() directly (embeddings / blocking
+    // vision) without racing the worker. resume() unparks it. The worker thread
+    // stays alive across the window (no thread churn, no cancellation).
+    //
+    // Caller MUST hold state.mtx so no new request is submitted during the
+    // window (chat submit also takes state.mtx). pause() blocks until the
+    // worker is idle and parked, bounded by timeout_ms (0 = no in-flight work
+    // to drain → returns immediately). Returns true once parked.
+    bool pause(int timeout_ms = 60000);
+    void resume();
+
+    // Submit a request for inference. Thread-safe.
+    // The request will be picked up by the worker on the next iteration.
+    void submit(std::shared_ptr<ServerRequest> req);
+
+    // Returns the number of active + pending requests.
+    int queue_depth() const;
+
+    bool is_running() const { return running_.load(std::memory_order_relaxed); }
+
+    // True after the worker declared the CUDA context poisoned and stopped
+    //. /health reports unhealthy so an orchestrator can restart the
+    // process — before this the server answered "ok" while every request
+    // failed with internal_error.
+    bool faulted() const { return faulted_.load(std::memory_order_relaxed); }
+
+private:
+    void worker_loop();
+
+    QuenchContext ctx_ = nullptr;  // non-owning
+
+    std::thread worker_thread_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> faulted_{false};
+
+    // Graceful pause handshake (see pause()/resume()). pause_requested_ tells
+    // the worker to drain in-flight work and park; paused_ reports that it has.
+    std::atomic<bool> pause_requested_{false};
+    std::atomic<bool> paused_{false};
+    std::mutex pause_mutex_;
+    std::condition_variable pause_cv_;
+
+    // Incoming request queue (HTTP threads -> worker thread)
+    mutable std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::deque<std::shared_ptr<ServerRequest>> pending_queue_;
+
+    // Active requests being processed by the engine
+    std::vector<std::shared_ptr<ServerRequest>> active_requests_;
+};

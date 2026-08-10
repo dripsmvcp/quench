@@ -1,0 +1,658 @@
+// Pre-dequant Phase 4: tensor registry.
+// Walks the model's WeightMap and registers each tensor's role +
+// runtime location in the GraphExecutor's tensor table. Also builds
+// per-layer NVFP4 device-args caches for the MoE prefill fast path.
+//
+// Extracted from executor_pre_dequant.cu in Phase 3 of the architecture
+// refactor roadmap. See pre_dequant_internal.h for shared helpers.
+
+#include "exec/executor.h"
+#include "exec/quant_pipeline.h"
+#include "exec/pre_dequant_internal.h"
+#include "core/logging.h"
+#include "quant/dequant_gpu.h"
+#include "runtime/storage_planner.h"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <utility>
+
+using quench::pre_dequant_internal::borrow_payload_from_wcache;
+using quench::pre_dequant_internal::infer_tier_from_wcache;
+
+namespace quench {
+
+void QuantPipeline::pre_dequant_phase4_tensor_registry_(
+    const ModelConfig& cfg, cudaStream_t stream) {
+    (void)stream;  // unused but kept for signature consistency
+    // Build WeightRegistry from wcache_ contents (phase-2 shim).
+    registry_->clear();
+    // Explicit kind overrides t.kind which is UNKNOWN after weight_upload.cu
+    // creates fresh Tensor descriptors (TensorKind is not preserved through
+    // the upload code paths). Plan-driven allocation requires kind to
+    // be correct, so we pass it explicitly from the field position.
+    auto register_tensor = [&](const Tensor& t, TensorKind kind) -> TensorID {
+        if (!t.data)
+            return kInvalidTensorID;
+        StorageTier tier = infer_tier_from_wcache(*wcache_, t.data);
+        // FP8 decode SIDECAR (gemm.fp8_ssm_proj): the wcache fp8 entry must
+        // not become the primary tier — prefill and M>1 verify chunks stay on
+        // the full-precision source (quality), only the M=1 decode GEMV takes
+        // the FP8 copy. Demote BEFORE the payload borrow below, or the union
+        // would carry an fp8 payload into FP16 paths.
+        // A native F16 resident with an fp8 entry is always the sidecar (the
+        // phase-2 prefill cache never keys F16 sources). A quantized (GGUF)
+        // source is the sidecar only when the entry carries per-row scales —
+        // the sidecar's marker — since the phase-2 FP8 *prefill* cache also
+        // keys quantized sources (per-tensor scale) and must stay primary.
+        bool fp8_decode_sidecar = false;
+        if (tier == StorageTier::FP8) {
+            if (t.qtype == QType::F16) {
+                fp8_decode_sidecar = true;
+            } else if (dequant_gpu_supported(t.qtype)) {
+                auto it = wcache_->fp8.find(t.data);
+                fp8_decode_sidecar =
+                    it != wcache_->fp8.end() && it->second.d_row_scales != nullptr;
+            }
+        }
+        if (fp8_decode_sidecar)
+            tier = StorageTier::FP16;
+        TensorID id = registry_->reserve(kind, t.shape[0], t.ndim > 1 ? t.shape[1] : 1);
+        auto& h = registry_->handle(id);
+        h.primary_tier = tier;
+        h.source_data = t.data;
+        h.source_qtype = t.qtype;
+        h.source_scales = t.scales;
+        h.source_tensor_scale = t.tensor_scale;
+        borrow_payload_from_wcache(h, *wcache_, t.data);
+
+        // Dual-tier dispatch: pick the best tier per operation type.
+        // Prefill (M>1): FP16 cuBLAS > FP8 cuBLAS > CUTLASS NVFP4 > source dequant
+        // Decode (M=1):  NVFP4 GEMV > FP8 GEMV > source dp4a GEMV
+        //
+        // Native NVFP4: all dense weights get FP16 prefill (dequanted at load)
+        // to avoid FP8 precision loss that compounds across 36 layers.
+        // Decode uses source NVFP4 data for GEMV (single-token, no compounding).
+        h.prefill_tier = tier;
+        h.decode_tier = tier;
+        if (tier == StorageTier::CUTLASS_NVFP4 && wcache_->fp16.count(t.data)) {
+            h.prefill_tier = StorageTier::FP16;
+            // Decode: use source NVFP4 data for GEMV (not the FP16 cache)
+        } else if (tier == StorageTier::CUTLASS_NVFP4 && wcache_->fp8.count(t.data)) {
+            h.prefill_tier = StorageTier::FP8;
+            h.decode_tier = StorageTier::FP8;
+        } else if (tier == StorageTier::CUTLASS_NVFP4 && wcache_->nvfp4.count(t.data)) {
+            h.decode_tier = StorageTier::NVFP4;
+        } else if (fp8_decode_sidecar) {
+            h.decode_tier = StorageTier::FP8;
+        }
+        return id;
+    };
+
+    for (int i = 0; i < cfg.n_layers; ++i) {
+        // const_cast: model_ is const Model* but the *_id fields are metadata
+        // stamped exactly once here during load — safe to mutate.
+        auto& L = const_cast<Model*>(model_)->layer(i);
+        L.wq_id = register_tensor(L.wq, TensorKind::WQ);
+        L.wk_id = register_tensor(L.wk, TensorKind::WK);
+        L.wv_id = register_tensor(L.wv, TensorKind::WV);
+        L.wo_id = register_tensor(L.wo, TensorKind::WO);
+        // MLA (DeepSeek-V2/V3) latent projections. register_tensor returns
+        // kInvalidTensorID for null tensors, so non-MLA models leave these unset.
+        L.kv_a_proj_id = register_tensor(L.kv_a_proj, TensorKind::KV_A_PROJ);
+        L.kv_a_norm_id = register_tensor(L.kv_a_layernorm, TensorKind::KV_A_NORM);
+        L.kv_b_proj_id = register_tensor(L.kv_b_proj, TensorKind::KV_B_PROJ);
+        L.w_gate_id = register_tensor(L.w_gate, TensorKind::W_GATE);
+        L.w_up_id = register_tensor(L.w_up, TensorKind::W_UP);
+        L.w_down_id = register_tensor(L.w_down, TensorKind::W_DOWN);
+        // Shared-expert FFN — matches StoragePlanner enumeration from PR #38.
+        L.w_gate_shared_id = register_tensor(L.w_gate_shared, TensorKind::W_GATE);
+        L.w_up_shared_id = register_tensor(L.w_up_shared, TensorKind::W_UP);
+        L.w_down_shared_id = register_tensor(L.w_down_shared, TensorKind::W_DOWN);
+        L.ssm_in_id = register_tensor(L.ssm_in, TensorKind::SSM_IN);
+        L.ssm_out_id = register_tensor(L.ssm_out, TensorKind::SSM_OUT);
+        L.gdn_gate_id = register_tensor(L.gdn_gate, TensorKind::GDN_GATE);
+        L.gdn_alpha_id = register_tensor(L.gdn_alpha, TensorKind::GDN_ALPHA);
+        L.gdn_beta_id = register_tensor(L.gdn_beta, TensorKind::GDN_BETA);
+        L.gdn_alpha_beta_packed_id = register_tensor(L.gdn_alpha_beta_packed, TensorKind::GDN_ALPHA_BETA_PACKED);
+        L.gdn_input_packed_id = register_tensor(L.gdn_input_packed, TensorKind::GDN_INPUT_PACKED);
+
+        // Per-expert TensorIDs (Task 3.4)
+        const int ne_layer = static_cast<int>(L.expert_w_gate.size());
+        const int ne_up = static_cast<int>(L.expert_w_up.size());
+        const int ne_down = static_cast<int>(L.expert_w_down.size());
+        L.expert_gate_ids.assign(ne_layer, kInvalidTensorID);
+        L.expert_up_ids.assign(ne_up, kInvalidTensorID);
+        L.expert_down_ids.assign(ne_down, kInvalidTensorID);
+        for (int e = 0; e < ne_layer; ++e)
+            L.expert_gate_ids[e] = register_tensor(L.expert_w_gate[e], TensorKind::EXPERT_GATE);
+        for (int e = 0; e < ne_up; ++e)
+            L.expert_up_ids[e] = register_tensor(L.expert_w_up[e], TensorKind::EXPERT_UP);
+        for (int e = 0; e < ne_down; ++e)
+            L.expert_down_ids[e] = register_tensor(L.expert_w_down[e], TensorKind::EXPERT_DOWN);
+        L.moe_gate_id = register_tensor(L.moe_gate, TensorKind::ROUTER);
+        L.shared_expert_gate_id = register_tensor(L.shared_expert_gate_inp, TensorKind::SHARED_EXPERT_GATE);
+
+        // Borrow nvfp4_moe pointers for packed 3D expert NVFP4 cache (Task 3.4)
+        {
+            auto it = wcache_->nvfp4_moe.find(L.expert_gate_packed.data);
+            L.nvfp4_moe_gate_ptr = (it != wcache_->nvfp4_moe.end()) ? &it->second : nullptr;
+        }
+        {
+            auto it = wcache_->nvfp4_moe.find(L.expert_up_packed.data);
+            L.nvfp4_moe_up_ptr = (it != wcache_->nvfp4_moe.end()) ? &it->second : nullptr;
+        }
+        {
+            auto it = wcache_->nvfp4_moe.find(L.expert_down_packed.data);
+            L.nvfp4_moe_down_ptr = (it != wcache_->nvfp4_moe.end()) ? &it->second : nullptr;
+        }
+        // Borrow fp16 pointers for packed expert tensors (Task 3.4)
+        {
+            auto it = wcache_->fp16.find(L.expert_gate_packed.data);
+            L.fp16_packed_gate_cache = (it != wcache_->fp16.end()) ? &it->second : nullptr;
+        }
+        {
+            auto it = wcache_->fp16.find(L.expert_up_packed.data);
+            L.fp16_packed_up_cache = (it != wcache_->fp16.end()) ? &it->second : nullptr;
+        }
+        {
+            auto it = wcache_->fp16.find(L.expert_down_packed.data);
+            L.fp16_packed_down_cache = (it != wcache_->fp16.end()) ? &it->second : nullptr;
+        }
+    }
+    // Register model-level (non-layer) tensors.
+    const_cast<Model*>(model_)->out_proj_id = register_tensor(model_->output_proj(), TensorKind::LM_HEAD);
+    const_cast<Model*>(model_)->tok_emb_id = register_tensor(model_->token_embedding(),
+                                                             TensorKind::TOK_EMBED);
+
+    // Register fused KV / gate+up overlays. Layer-keyed (not pointer-keyed)
+    // because a fused tensor is built fresh — the source pointers (wk, wv)
+    // are the *unfused* weights and don't appear in any per-tensor wcache_ map.
+    //
+    // Ownership transfer (Phase 4.2): the registry handle takes ownership of
+    // the GPU pointer. `h.owned_bytes` is set to the allocation size so the
+    // registry destructor (`free_owned_storage`) will free it. The wcache_
+    // map entry is erased after transfer so that the workspace cleanup's
+    // wcache_->fused_kv loop becomes a no-op — no double-free.
+    auto register_fused = [&](TensorKind kind, const Tensor& t) -> TensorID {
+        if (!t.data)
+            return kInvalidTensorID;
+        TensorID id = registry_->reserve(kind, t.shape[0], t.ndim > 1 ? t.shape[1] : 1);
+        auto& h = registry_->handle(id);
+        h.primary_tier = StorageTier::FP16;
+        h.payload.fp16.data = static_cast<half*>(t.data);
+        h.owned_bytes = static_cast<int64_t>(t.nbytes());
+        return id;
+    };
+    for (int i = 0; i < cfg.n_layers; ++i) {
+        auto& L = const_cast<Model*>(model_)->layer(i);
+        if (auto it = wcache_->fused_kv.find(i); it != wcache_->fused_kv.end()) {
+            L.fused_kv_id = register_fused(TensorKind::FUSED_KV, it->second);
+        }
+        if (auto it = wcache_->fused_gate_up.find(i); it != wcache_->fused_gate_up.end()) {
+            L.fused_gate_up_id = register_fused(TensorKind::FUSED_GATE_UP, it->second);
+        }
+    }
+    // Transfer storage ownership: clear the wcache_->fused_kv / fused_gate_up
+    // maps so the legacy cleanup loops in executor_workspace_buffers.cu find
+    // them empty. The underlying pointers live on in the registry handles
+    // and are freed by `registry_->free_owned_storage()` in workspace cleanup.
+    wcache_->fused_kv.clear();
+    wcache_->fused_gate_up.clear();
+
+    QUENCH_LOG_INFO("WeightRegistry populated with %zu handles (phase-2 shim)", registry_->size());
+
+    // Phase 4 (Option C) overlay diagnostic: report ideal vs actual overlay
+    // population. The plan enumerates every quantize-able tensor at its
+    // preferred tier ("ideal overlay"). The registry tracks tensors actually
+    // cached by the runtime ("actual overlay"). Native GGUF blocks (Q4_K_M,
+    // Q5_K_M, Q6_K, Q8_0, MXFP4) stay as mmap'd `Model::gpu_allocations_`
+    // and are dequantized per kernel call — they bypass the overlay layer
+    // entirely, so the diff between plan and registry is informational, not
+    // an error.
+    {
+        // Stage 1: reuse the persistent plan built at the top of
+        // pre_dequant_weights() instead of re-running plan_storage a third time.
+        const StoragePlan& ideal_plan = storage_plan_;
+        size_t plan_overlay = 0;
+        size_t plan_fp16 = 0, plan_fp8 = 0, plan_nvfp4 = 0;
+        size_t plan_cutlass_nvfp4 = 0, plan_mxfp4 = 0, plan_fp32 = 0;
+        for (const auto& e : ideal_plan.entries) {
+            switch (e.tier) {
+                case StorageTier::FP16:
+                    ++plan_fp16;
+                    ++plan_overlay;
+                    break;
+                case StorageTier::FP8:
+                    ++plan_fp8;
+                    ++plan_overlay;
+                    break;
+                case StorageTier::NVFP4:
+                    ++plan_nvfp4;
+                    ++plan_overlay;
+                    break;
+                case StorageTier::CUTLASS_NVFP4:
+                    ++plan_cutlass_nvfp4;
+                    ++plan_overlay;
+                    break;
+                case StorageTier::MXFP4:
+                    ++plan_mxfp4;
+                    ++plan_overlay;
+                    break;
+                case StorageTier::FP32:
+                    ++plan_fp32;
+                    break;
+                case StorageTier::Undefined:
+                    break;
+            }
+        }
+        size_t registry_count = registry_->size();
+        QUENCH_LOG_INFO(
+            "Phase-4 overlay: registry=%zu cached / plan-ideal=%zu "
+            "(uncached %zu remain as native GGUF blocks)",
+            registry_count, plan_overlay, plan_overlay > registry_count ? plan_overlay - registry_count : 0);
+
+        // When there is a registry/plan gap, surface the by-kind delta so the
+        // missing TensorKinds are immediately visible. Helps when adding a new
+        // model that has tensor kinds the runtime caches but plan_storage
+        // doesn't yet enumerate (or vice versa).
+        if (registry_count < plan_overlay) {
+            int plan_per_kind[std::to_underlying(TensorKind::COUNT)] = {0};
+            int registry_per_kind[std::to_underlying(TensorKind::COUNT)] = {0};
+            for (const auto& e : ideal_plan.entries) {
+                bool overlay = (e.tier == StorageTier::FP16 || e.tier == StorageTier::FP8 ||
+                                e.tier == StorageTier::NVFP4 || e.tier == StorageTier::CUTLASS_NVFP4 ||
+                                e.tier == StorageTier::MXFP4);
+                if (overlay)
+                    ++plan_per_kind[std::to_underlying(e.kind)];
+            }
+            for (TensorID id = 0; id < static_cast<TensorID>(registry_->size()); ++id) {
+                ++registry_per_kind[static_cast<int>(registry_->handle(id).kind)];
+            }
+            for (int k = 0; k < std::to_underlying(TensorKind::COUNT); ++k) {
+                int diff = plan_per_kind[k] - registry_per_kind[k];
+                if (diff > 0) {
+                    QUENCH_LOG_INFO("Phase-4 gap by kind: %s plan=%d registry=%d (uncached=%d)",
+                                 tensor_kind_name(static_cast<TensorKind>(k)), plan_per_kind[k],
+                                 registry_per_kind[k], diff);
+                }
+            }
+        }
+        QUENCH_LOG_INFO(
+            "Phase-4 plan-ideal tiers: fp16=%zu fp8=%zu nvfp4=%zu "
+            "cutlass_nvfp4=%zu mxfp4=%zu fp32=%zu",
+            plan_fp16, plan_fp8, plan_nvfp4, plan_cutlass_nvfp4, plan_mxfp4, plan_fp32);
+        QUENCH_LOG_INFO(
+            "Phase-4 wcache actual: fp16=%zu fp8=%zu nvfp4=%zu "
+            "cutlass_nvfp4=%zu cutlass_mxfp4=%zu nvfp4_moe=%zu "
+            "fused_kv=%zu fused_gate_up=%zu",
+            wcache_->fp16.size(), wcache_->fp8.size(), wcache_->nvfp4.size(), wcache_->cutlass_nvfp4.size(),
+            wcache_->cutlass_mxfp4.size(), wcache_->nvfp4_moe.size(), wcache_->fused_kv.size(),
+            wcache_->fused_gate_up.size());
+
+        // Stage 1 plan-vs-actual parity diagnostic: for every plan entry whose
+        // tier is an overlay, compare the planned tier against the tier the
+        // legacy build path actually produced (inferred from which wcache map
+        // the source pointer landed in). A mismatch means switching this
+        // builder to plan-driven would change behaviour — it MUST be understood
+        // (expected budget-eviction, or a real arch-rule the plan doesn't yet
+        // encode) before that builder is migrated. Pure diagnostic; logs only.
+        // The planned tier here is the post-downgrade tier; budget eviction
+        // (planned overlay → actual native/uncached) is the common benign case.
+        {
+            // "Present in the planned tier's map?" — NOT first-hit. A GGUF weight
+            // legitimately appears in BOTH wcache_->nvfp4 (its tier) AND
+            // wcache_->cutlass_nvfp4 (the dead G3 SF buffer); first-hit would
+            // falsely flag it. We ask: did the legacy build put this source into
+            // the map the plan chose? If yes → matched (extra overlays are a
+            // separate G3 concern). If it landed in a DIFFERENT map → real
+            // mismatch (the plan and the legacy path disagree on tier). If it
+            // landed nowhere → evicted (budget / native fallback, benign).
+            auto present_in = [&](StorageTier t, const void* src) -> bool {
+                switch (t) {
+                    case StorageTier::FP16: return wcache_->fp16.count(src) > 0;
+                    case StorageTier::FP8: return wcache_->fp8.count(src) > 0;
+                    case StorageTier::NVFP4: return wcache_->nvfp4.count(src) > 0;
+                    case StorageTier::CUTLASS_NVFP4: return wcache_->cutlass_nvfp4.count(src) > 0;
+                    case StorageTier::MXFP4: return wcache_->cutlass_mxfp4.count(src) > 0;
+                    default: return false;
+                }
+            };
+            auto any_overlay = [&](const void* src) -> bool {
+                return wcache_->fp16.count(src) || wcache_->fp8.count(src) ||
+                       wcache_->nvfp4.count(src) || wcache_->cutlass_nvfp4.count(src) ||
+                       wcache_->cutlass_mxfp4.count(src);
+            };
+            int mismatch = 0, evicted = 0, matched = 0;
+            for (const auto& e : ideal_plan.entries) {
+                const bool plan_overlay_e =
+                    (e.tier == StorageTier::FP16 || e.tier == StorageTier::FP8 ||
+                     e.tier == StorageTier::NVFP4 || e.tier == StorageTier::CUTLASS_NVFP4 ||
+                     e.tier == StorageTier::MXFP4);
+                if (!plan_overlay_e)
+                    continue;
+                if (present_in(e.tier, e.source_data)) {
+                    ++matched;
+                } else if (e.fp16_companion && present_in(StorageTier::FP16, e.source_data)) {
+                    // gemma-3 companion: planned NVFP4 + FP16 backing; when the
+                    // NVFP4 primary is budget-evicted only the FP16 companion
+                    // remains. Expected degraded state, not a tier disagreement.
+                    ++matched;
+                } else if (any_overlay(e.source_data)) {
+                    ++mismatch;
+                    StorageTier actual = infer_tier_from_wcache(*wcache_, e.source_data);
+                    QUENCH_LOG_INFO("Phase-4 plan/actual MISMATCH: %s plan-tier=%d actual-tier=%d",
+                                 tensor_kind_name(e.kind), std::to_underlying(e.tier),
+                                 std::to_underlying(actual));
+                } else {
+                    ++evicted;  // planned overlay but not cached (budget / native fallback)
+                }
+            }
+            QUENCH_LOG_INFO("Phase-4 plan/actual parity: matched=%d mismatch=%d evicted=%d",
+                         matched, mismatch, evicted);
+        }
+        // Native layer counterpart to the overlay diagnostic: tensors uploaded
+        // as their on-disk format and dispatched through qtype-specific kernels
+        // (no tier choice, no cascade-bug class). gpu_allocations_ tracks every
+        // GPU pointer the Model owns — Q4_K_M / Q5_K_M / Q6_K / Q8_0 / MXFP4
+        // blocks, norms, embeddings, scratch buffers. Together with the overlay
+        // counts above this gives the full Option-C two-layer storage picture.
+        QUENCH_LOG_INFO(
+            "Phase-4 native: %zu Model::gpu_allocations_ pointers "
+            "(GGUF blocks + norms + scratch — bypass the overlay layer)",
+            model_->gpu_allocations_.size());
+
+        // Decode-redundancy diagnostic: how many bytes of original GGUF the
+        // overlay tier (NVFP4 / CUTLASS_NVFP4 / FP8 / MXFP4) covers for DECODE.
+        // This is an UPPER BOUND, not freeable VRAM: M>1 prefill still reads the
+        // GGUF source for these weights — Q8_0/Q4_K via IMMA raw-read on the
+        // source, Q6_K/Q5_K via on-the-fly dequant or CUTLASS — so the source
+        // stays resident under the current strict-quality-neutral prefill paths.
+        // (The earlier "could be freed / deferred to 5.1.4.b" wording was wrong
+        // since IMMA raw-read prefill; Phase 4b correctly frees nothing for
+        // these, see its source-pointer guard.) FP16-cached weights keep the
+        // original for dp4a decode and are not counted.
+        {
+            size_t decode_redundant_count = 0;
+            size_t decode_redundant_bytes = 0;
+            for (TensorID id = 0; id < static_cast<TensorID>(registry_->size()); ++id) {
+                const auto& h = registry_->handle(id);
+                if (!h.can_drop_source())
+                    continue;
+                int64_t cols = h.shape[1] > 0 ? h.shape[1] : 1;
+                size_t row_bytes = qtype_row_bytes(h.source_qtype, cols);
+                size_t bytes = row_bytes * static_cast<size_t>(h.shape[0]);
+                decode_redundant_bytes += bytes;
+                ++decode_redundant_count;
+            }
+            QUENCH_LOG_INFO(
+                "Phase-4 decode-redundancy: %zu handles, %.2f MiB of GGUF source is "
+                "decode-redundant (overlay covers decode) but kept resident for "
+                "M>1 prefill (upper bound, not freeable).",
+                decode_redundant_count, decode_redundant_bytes / (1024.0 * 1024.0));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3c-full Step 3: pre-cache per-layer NVFP4 device-args ptr arrays.
+    // -----------------------------------------------------------------------
+    // The CUTLASS 3.x device-args dispatch (Phase 3c-full Step 2b,
+    // moe.nvfp4_device_args) consumes per-expert weight pointers as
+    // device-resident arrays. Per-call host iteration + 3× cudaMemcpyAsync
+    // (~3 KiB total) was the residual overhead blocking full CUDA-graph
+    // capture of the MoE prefill. Build the caches once here while the
+    // handle payloads are guaranteed populated; the forward path then uses
+    // the device pointers directly.
+    //
+    // Conditions: model is MoE (ne > 0) and at least one layer has all three
+    // projections backed by CUTLASS NVFP4 handles (post-Phase-3 setup).
+    {
+        const int ne = cfg.n_experts;
+        const int n_layers = cfg.n_layers;
+        if (ne > 0) {
+        moe_->per_layer_da_cache.assign(n_layers, MoEWorkspace::PerLayerNvfp4DeviceArgsCache{});
+
+        std::vector<const void*> h_B_ptrs(ne), h_SFB_ptrs(ne);
+        std::vector<float>       h_alpha(ne);
+        bool any_built = false;
+
+        auto build_proj =
+            [&](const std::vector<TensorID>& ids, const void**& d_B,
+                const void**& d_SFB, float*& d_alpha) -> bool {
+                if (static_cast<int>(ids.size()) != ne)
+                    return false;
+                for (int e = 0; e < ne; ++e) {
+                    if (ids[e] == kInvalidTensorID)
+                        return false;
+                    const auto& h = registry_->handle(ids[e]);
+                    if (!h.payload.cutlass_nvfp4.weight ||
+                        !h.payload.cutlass_nvfp4.sf)
+                        return false;
+                    h_B_ptrs[e]   = h.payload.cutlass_nvfp4.weight;
+                    h_SFB_ptrs[e] = h.payload.cutlass_nvfp4.sf;
+                    h_alpha[e]    = h.payload.cutlass_nvfp4.global_scale
+                                        ? *h.payload.cutlass_nvfp4.global_scale
+                                        : 1.0f;
+                }
+                cudaError_t err;
+                err = cudaMalloc(&d_B,   ne * sizeof(const void*)); if (err != cudaSuccess) return false;
+                err = cudaMalloc(&d_SFB, ne * sizeof(const void*)); if (err != cudaSuccess) return false;
+                err = cudaMalloc(&d_alpha, ne * sizeof(float));     if (err != cudaSuccess) return false;
+                cudaMemcpy(const_cast<void**>(d_B),   h_B_ptrs.data(),
+                           ne * sizeof(const void*), cudaMemcpyHostToDevice);
+                cudaMemcpy(const_cast<void**>(d_SFB), h_SFB_ptrs.data(),
+                           ne * sizeof(const void*), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_alpha, h_alpha.data(),
+                           ne * sizeof(float),       cudaMemcpyHostToDevice);
+                return true;
+            };
+
+        int eligible_layers = 0;  // layers that have any MoE expert ptrs
+        int built_layers = 0;
+        int host_resident_layers = 0;  // intentionally not built (force_host or budget offload)
+        std::vector<int> failed_layers;
+        // The loader pre-sizes the expert id vectors on EVERY layer of a
+        // hybrid model (SSM/attention layers carry all-invalid ids), so
+        // "has expert ids" must mean "has at least one VALID id" — the
+        // empty()-based checks misclassified all 29 Nemotron-H non-MoE
+        // layers as MoE-eligible (tripping the coverage abort below) and left the
+        // non-gated gate projection permanently "present but failed".
+        auto any_valid_id = [](const std::vector<TensorID>& ids) {
+            return std::any_of(ids.begin(), ids.end(),
+                               [](TensorID id) { return id != kInvalidTensorID; });
+        };
+        for (int li = 0; li < n_layers; ++li) {
+            const auto& L = model_->layer(li);
+            auto& c = moe_->per_layer_da_cache[li];
+            const bool moe_layer = any_valid_id(L.expert_up_ids) ||
+                                   any_valid_id(L.expert_down_ids) ||
+                                   any_valid_id(L.expert_gate_ids);
+            if (!moe_layer) {
+                // Pure dense layer in a hybrid model (e.g. attention-only layer
+                // alongside MoE layers). Not eligible for the da_cache; skip
+                // without counting against the must-populate gate.
+                continue;
+            }
+            // Host-resident layers (host-offload / force_host_experts) by
+            // design have no CUTLASS NVFP4 weight payload — the per-layer
+            // fallback dispatch is the intended path. Don't count these as
+            // build failures. Detect via either packed-tensor (GGUF Path A)
+            // or per-expert tensor (SafeTensors Path B) staying on host.
+            const bool packed_host = (L.expert_up_packed.data && !L.expert_up_packed.on_device);
+            bool per_expert_host = false;
+            if (!packed_host && !L.expert_w_up.empty()) {
+                // Any per-expert weight on host => layer is host-resident.
+                for (const auto& w : L.expert_w_up) {
+                    if (w.data && !w.on_device) { per_expert_host = true; break; }
+                }
+            }
+            if (packed_host || per_expert_host) {
+                ++host_resident_layers;
+                continue;
+            }
+            ++eligible_layers;
+            // Non-gated experts (RELU² — Nemotron-H) have no gate projection:
+            // gate ids are absent (empty or all-invalid). The empty()-only
+            // check left c.ready=false on every Nemotron-H layer, silently
+            // forcing the per-call H2D fallback dispatch (and, under graph
+            // capture, a memcpy node reading a dead stack buffer).
+            const bool gate_absent = !any_valid_id(L.expert_gate_ids);
+            bool g_ok = !gate_absent &&
+                        build_proj(L.expert_gate_ids, c.d_gate_B_ptrs,
+                                   c.d_gate_SFB_ptrs, c.d_gate_alpha);
+            bool u_ok = build_proj(L.expert_up_ids, c.d_up_B_ptrs,
+                                   c.d_up_SFB_ptrs, c.d_up_alpha);
+            bool d_ok = build_proj(L.expert_down_ids, c.d_down_B_ptrs,
+                                   c.d_down_SFB_ptrs, c.d_down_alpha);
+            c.ready = (g_ok || gate_absent) && u_ok && d_ok;
+            if (c.ready) {
+                ++built_layers;
+                any_built = true;
+            } else {
+                failed_layers.push_back(li);
+            }
+        }
+        // Coverage abort: hard-fail (not log-INFO)
+        // when the NVFP4 da_cache populates <100% of MoE-eligible layers.
+        // Partial coverage means the per-layer fallback fires for the missing
+        // layers and decode silently regresses ~5× on Qwen3-Coder / Gemma-4
+        // NVFP4.
+        // A partial build is almost always a load-time symptom of a
+        // mismatched expert layout or a budget that fell short of needed
+        // device allocations — the right response is to fail loud at init
+        // rather than ship the user a slow build.
+        // Only abort on *partial* coverage of device-resident MoE layers
+        // (the genuine "silent 5× regression" case). If nothing built at
+        // all, this model isn't going through the NVFP4 MoE da_cache path
+        // at runtime — log INFO and continue (covers --no-nvfp4 on GGUF
+        // MoE, Q4_K_M / Q6_K MoE without prequant scales, and synthetic
+        // force_host_experts spikes).
+        if (eligible_layers > 0 && built_layers > 0 && built_layers < eligible_layers) {
+            std::string failed_str;
+            for (size_t i = 0; i < failed_layers.size() && i < 16; ++i) {
+                if (!failed_str.empty()) failed_str += ", ";
+                failed_str += std::to_string(failed_layers[i]);
+            }
+            if (failed_layers.size() > 16) failed_str += ", …";
+            QUENCH_LOG_FATAL(
+                "NVFP4 da_cache: only %d/%d MoE-eligible layers populated. "
+                "Failing layers: [%s]. Partial coverage forces the per-layer "
+                "fallback dispatch (~5× slower decode on NVFP4 MoE models). "
+                "Likely cause: missing expert_*_ids, invalid CutlassNvFP4 "
+                "weight handles, or cudaMalloc failure for the per-layer "
+                "ptr arrays. Aborting before the engine silently ships a "
+                "slow build.",
+                built_layers, eligible_layers, failed_str.c_str());
+            std::abort();
+        }
+        if (any_built) {
+            QUENCH_LOG_INFO(
+                "Pre-cached per-layer NVFP4 device-args ptr arrays for "
+                "%d/%d layers × 3 projections × %d experts (~%.1f KiB)",
+                built_layers, eligible_layers, ne,
+                (built_layers * 3.0 * ne * (2 * sizeof(void*) + sizeof(float))) /
+                    1024.0);
+        }
+        if (host_resident_layers > 0) {
+            QUENCH_LOG_INFO(
+                "NVFP4 da_cache: skipped %d host-resident MoE layer(s) "
+                "(per-layer fallback / H2D staging is the intended path).",
+                host_resident_layers);
+        }
+        }  // ne > 0
+    }
+}
+
+// Free a GGUF source allocation only when NO path still reads it. The guard
+// below (try_mark) frees a source iff it's a base allocation AND not present in
+// wcache_->nvfp4 / wcache_->cutlass_nvfp4. For decode-cached weights the source
+// IS present in those maps (keyed on the source pointer), so they are correctly
+// SKIPPED — M>1 prefill reads the GGUF source (IMMA raw-read / dequant /
+// CUTLASS) under the strict-quality-neutral prefill paths. Net effect today:
+// near-zero sources freed, by design — the decode-redundancy diagnostic in
+// Phase 4 is an upper bound, not freeable VRAM. The mark also sets
+// Tensor.dropped_source so any raw-deref path that DID lose its source would
+// log a coverage-gap warning instead of reading freed memory.
+void QuantPipeline::pre_dequant_phase4b_drop_redundant_sources_(
+    const ModelConfig& cfg, cudaStream_t stream) {
+    auto* mut_model = const_cast<Model*>(model_);
+    size_t marked_bytes = 0;
+    size_t marked_count = 0;
+
+    size_t skipped_shared_count = 0;
+    size_t skipped_shared_bytes = 0;
+    auto try_mark = [&](Tensor& t, TensorID id) -> bool {
+        if (id == kInvalidTensorID || !t.data || t.dropped_source)
+            return false;
+        const auto& h = registry_->handle(id);
+        if (!h.can_drop_source())
+            return false;
+        if (h.source_data != t.data)
+            return false;
+        int64_t cols = t.ndim > 1 ? t.shape[1] : 1;
+        size_t bytes = qtype_row_bytes(t.qtype, cols) * static_cast<size_t>(t.shape[0]);
+        if (!mut_model->is_base_gpu_allocation(t.data)) {
+            ++skipped_shared_count;
+            skipped_shared_bytes += bytes;
+            return false;
+        }
+        if (wcache_->cutlass_nvfp4.count(t.data) > 0 ||
+            wcache_->nvfp4.count(t.data) > 0) {
+            ++skipped_shared_count;
+            skipped_shared_bytes += bytes;
+            return false;
+        }
+        mut_model->release_gpu_allocation(t.data);
+        QUENCH_CUDA_CHECK_LOG(cudaFreeAsync(t.data, stream));
+        t.dropped_source = true;
+        marked_bytes += bytes;
+        marked_count++;
+        return true;
+    };
+
+    for (int i = 0; i < cfg.n_layers; ++i) {
+        auto& L = mut_model->layer(i);
+        try_mark(L.wq, L.wq_id);
+        try_mark(L.wk, L.wk_id);
+        try_mark(L.wv, L.wv_id);
+        // try_mark(L.wo, L.wo_id);  // residual-fuse uses original
+        try_mark(L.w_gate, L.w_gate_id);
+        try_mark(L.w_up, L.w_up_id);
+        // try_mark(L.w_down, L.w_down_id);  // residual-fuse uses original
+        try_mark(L.w_gate_shared, L.w_gate_shared_id);
+        try_mark(L.w_up_shared, L.w_up_shared_id);
+        // try_mark(L.w_down_shared, L.w_down_shared_id);  // residual-fuse uses original
+        try_mark(L.ssm_in, L.ssm_in_id);
+        try_mark(L.ssm_out, L.ssm_out_id);
+    }
+    if (mut_model->out_proj_id != kInvalidTensorID)
+        try_mark(mut_model->out_proj_, mut_model->out_proj_id);
+    if (mut_model->tok_emb_id != kInvalidTensorID)
+        try_mark(mut_model->tok_emb_, mut_model->tok_emb_id);
+
+    if (marked_count > 0) {
+        // Source tensors are now freed (their .data is dangling). release_gpu_-
+        // allocation() above already flagged the model as sources-consumed so a
+        // second engine on this handle is rejected up front.
+        QUENCH_LOG_INFO(
+            "Phase-4b drop-source: freed %zu sources (%.2f MiB). "
+            "Skipped %zu sources (%.2f MiB) that are offsets into shared "
+            "allocations.",
+            marked_count, marked_bytes / (1024.0 * 1024.0),
+            skipped_shared_count, skipped_shared_bytes / (1024.0 * 1024.0));
+        // Drain async frees. cudaFreeAsync returns allocations to the pool
+        // WITHOUT releasing physical pages (no WDDM page release → no
+        // cuBLAS status-14). The pool retains the memory for reuse by
+        // future cudaMallocAsync calls. Physical reclaim is deferred to
+        // Model::~Model which trims the pool after all weights are freed.
+        cudaStreamSynchronize(stream);
+        QUENCH_LOG_INFO("Phase-4b: async pool reclaimed %.2f MiB (retained in pool)",
+                     marked_bytes / (1024.0 * 1024.0));
+    }
+}
+
+}  // namespace quench

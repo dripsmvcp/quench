@@ -1,0 +1,541 @@
+#include "runtime/config.h"
+#include "core/logging.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <unistd.h>
+#include <pwd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+namespace quench {
+
+namespace {
+
+// ----- Tiny INI/TOML-subset parser ---------------------------------------
+//
+// Supports:
+//   [section]            section header
+//   key = value          plain
+//   key = "value"        quoted string
+//   key = true | false   booleans
+//   key = 42             integers
+//   key = 3.14           floats
+//   # comment            line comment
+//
+// This is a minimal subset of TOML — enough for quench.conf which is flat
+// (no nested tables, no arrays). When the project picks up tomlplusplus
+// the parser body here can be replaced without touching the call sites.
+
+std::string trim(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r'))
+        ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r'))
+        --e;
+    return s.substr(b, e - b);
+}
+
+std::string strip_quotes(const std::string& s) {
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') || (s.front() == '\'' && s.back() == '\''))) {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+bool parse_bool(const std::string& v, bool fallback) {
+    if (v == "true" || v == "True" || v == "1" || v == "yes" || v == "on")
+        return true;
+    if (v == "false" || v == "False" || v == "0" || v == "no" || v == "off")
+        return false;
+    return fallback;
+}
+
+int parse_int(const std::string& v, int fallback) {
+    if (v.empty())
+        return fallback;
+    try {
+        return std::stoi(v);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+float parse_float(const std::string& v, float fallback) {
+    if (v.empty())
+        return fallback;
+    try {
+        return std::stof(v);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+// Apply a single dotted key (e.g. "kv_cache.dtype") with raw value string.
+// Returns false when the key is not bound — the caller decides what that
+// means: an quench.conf may legitimately carry a key this build does not know,
+// a `--set` on the command line is a typo and must not pass silently.
+bool apply_one(RuntimeConfig& cfg, const std::string& dotted_key, const std::string& raw) {
+    std::string val = strip_quotes(trim(raw));
+
+    // Typed key binders. Each binds one dotted key to its destination field;
+    // the field's type selects the parser, and the compiler rejects a key bound
+    // to a wrong-typed field. First match wins (the `matched` guard mirrors the
+    // old else-if short-circuit); unknown keys fall through to the warning.
+    bool matched = false;
+    auto B = [&](const char* k, bool& f) {
+        if (!matched && dotted_key == k) { f = parse_bool(val, f); matched = true; }
+    };
+    auto I = [&](const char* k, int& f) {
+        if (!matched && dotted_key == k) { f = parse_int(val, f); matched = true; }
+    };
+    auto F = [&](const char* k, float& f) {
+        if (!matched && dotted_key == k) { f = parse_float(val, f); matched = true; }
+    };
+    auto S = [&](const char* k, std::string& f) {
+        if (!matched && dotted_key == k) { f = val; matched = true; }
+    };
+
+    // [runtime]
+    B("runtime.deterministic_gemm", cfg.runtime.deterministic_gemm);
+    if (!matched && dotted_key == "runtime.deterministic") {
+        cfg.runtime.deterministic = parse_bool(val, cfg.runtime.deterministic);
+        // Full determinism implies deterministic GEMM algo selection — the
+        // compute kernels gate routing/sampling determinism on the same
+        // process_diag_deterministic_gemm() snapshot, so this one switch
+        // covers GEMM + MoE routing + top-k sampling.
+        if (cfg.runtime.deterministic)
+            cfg.runtime.deterministic_gemm = true;
+        matched = true;
+    }
+    S("runtime.cuda_graphs", cfg.runtime.cuda_graphs);
+    B("runtime.warmup", cfg.runtime.warmup);
+    I("runtime.max_seq_len", cfg.runtime.max_seq_len);
+    B("runtime.no_pdl", cfg.runtime.no_pdl);
+    B("runtime.debug_raw", cfg.runtime.debug_raw);
+    B("runtime.no_vision_graph", cfg.runtime.no_vision_graph);
+    I("runtime.vision_max_patches", cfg.runtime.vision_max_patches);
+    S("runtime.graph_capture_mode", cfg.runtime.graph_capture_mode);
+    B("runtime.prefill_graph", cfg.runtime.prefill_graph);
+    I("runtime.max_batch_size", cfg.runtime.max_batch_size);
+    I("runtime.decode_burst", cfg.runtime.decode_burst);
+    I("runtime.prefill_chunk_decode_cap", cfg.runtime.prefill_chunk_decode_cap);
+    I("runtime.hybrid_decode_quantum", cfg.runtime.hybrid_decode_quantum);
+    B("runtime.decode_pipeline", cfg.runtime.decode_pipeline);
+    I("runtime.vram_budget_mb", cfg.runtime.vram_budget_mb);
+
+    // [kv_cache]
+    S("kv_cache.dtype", cfg.kv_cache.dtype);
+    B("kv_cache.allow_nondeterministic_fp8", cfg.kv_cache.allow_nondeterministic_fp8);
+    B("kv_cache.fp8_auto_legacy", cfg.kv_cache.fp8_auto_legacy);
+    I("kv_cache.bitdecoding_residual_tokens", cfg.kv_cache.bitdecoding_residual_tokens);
+    B("kv_cache.bitdecoding_qk", cfg.kv_cache.bitdecoding_qk);
+    S("kv_cache.swa_sizing", cfg.kv_cache.swa_sizing);
+    I("kv_cache.swa_snapshot_mb", cfg.kv_cache.swa_snapshot_mb);
+    I("kv_cache.max_blocks", cfg.kv_cache.max_blocks);
+
+    // [rope]
+    S("rope.scaling", cfg.rope.scaling);
+    F("rope.factor", cfg.rope.factor);
+    I("rope.orig_ctx", cfg.rope.orig_ctx);
+    F("rope.attn_factor", cfg.rope.attn_factor);
+    F("rope.beta_fast", cfg.rope.beta_fast);
+    F("rope.beta_slow", cfg.rope.beta_slow);
+
+    // [vram]
+    F("vram.kv_fraction", cfg.vram.kv_fraction);
+    I("vram.reserve_floor_pct", cfg.vram.reserve_floor_pct);
+    I("vram.library_reserve_mb", cfg.vram.library_reserve_mb);
+    S("vram.library_reserve_cache", cfg.vram.library_reserve_cache);
+
+    // [attention]
+    S("attention.fp8_prefill", cfg.attention.fp8_prefill);
+    S("attention.fp8_fmha", cfg.attention.fp8_fmha);
+    S("attention.fmha_sm120", cfg.attention.fmha_sm120);
+    S("attention.fmha_fa2", cfg.attention.fmha_fa2);
+    S("attention.fa2_fp16qk", cfg.attention.fa2_fp16qk);
+    B("attention.fa2_f16acc", cfg.attention.fa2_f16acc);
+    B("attention.fa2_hd256", cfg.attention.fa2_hd256);
+    B("attention.fa2_pv_f16acc", cfg.attention.fa2_pv_f16acc);
+    B("attention.fp8_qk_scaled", cfg.attention.fp8_qk_scaled);
+    I("attention.fmha_prefill_threshold", cfg.attention.fmha_prefill_threshold);
+    I("attention.attn_scores_mib", cfg.attention.attn_scores_mib);
+    S("attention.mxfp4", cfg.attention.mxfp4);
+    B("attention.mxfp4_blockscale", cfg.attention.mxfp4_blockscale);
+    B("attention.mxfp4_ksmooth", cfg.attention.mxfp4_ksmooth);
+    B("attention.mxfp4_pv_fp4", cfg.attention.mxfp4_pv_fp4);
+    F("attention.mxfp4_promote_budget", cfg.attention.mxfp4_promote_budget);
+    B("attention.mxfp4_paged_kv", cfg.attention.mxfp4_paged_kv);
+    B("attention.mxfp4_fp16_fallback", cfg.attention.mxfp4_fp16_fallback);
+    S("attention.mxfp4_fp16_cache_policy", cfg.attention.mxfp4_fp16_cache_policy);
+    B("attention.force_cublas_decode", cfg.attention.force_cublas_decode);
+    B("attention.mla_absorb", cfg.attention.mla_absorb);
+    B("attention.no_qknorm_fused", cfg.attention.no_qknorm_fused);
+    B("diagnostics.spec_trace", cfg.diagnostics.spec_trace);
+    B("diagnostics.jump_trace", cfg.diagnostics.jump_trace);
+    S("diagnostics.ppl_dump", cfg.diagnostics.ppl_dump);
+    B("attention.splitk_pipe", cfg.attention.splitk_pipe);
+    B("attention.fp8_tile", cfg.attention.fp8_tile);
+    B("attention.fp8_tile_gqa", cfg.attention.fp8_tile_gqa);
+    B("attention.gate_concat", cfg.attention.gate_concat);
+
+    // [moe]
+    I("moe.expert_overhead_pct", cfg.moe.expert_overhead_pct);
+    I("moe.force_host_experts", cfg.moe.force_host_experts);
+    B("moe.skip", cfg.moe.skip);
+    B("moe.force_fp16_sync", cfg.moe.force_fp16_sync);
+    B("moe.no_expert_cache", cfg.moe.no_expert_cache);
+    B("moe.expert_cache_debug_parity", cfg.moe.expert_cache_debug_parity);
+    I("moe.prefetch_top_k", cfg.moe.prefetch_top_k);
+    B("moe.allow_graphs_under_offload", cfg.moe.allow_graphs_under_offload);
+    B("moe.zero_workspace", cfg.moe.zero_workspace);
+    B("moe.no_shared_mlp", cfg.moe.no_shared_mlp);
+    B("moe.no_shexp_gate", cfg.moe.no_shexp_gate);
+    B("moe.no_cutlass3x", cfg.moe.no_cutlass3x);
+    I("moe.reserve_mib", cfg.moe.reserve_mib);
+    B("moe.nvfp4_device_args", cfg.moe.nvfp4_device_args);
+    B("moe.nvfp4_smallM", cfg.moe.nvfp4_smallM);
+    I("moe.nvfp4_smallM_threshold", cfg.moe.nvfp4_smallM_threshold);
+    I("moe.mr_nr", cfg.moe.mr_nr);
+
+    // [gdn]
+    B("gdn.fp32_scan", cfg.gdn.fp32_scan);
+    B("gdn.fp32_out", cfg.gdn.fp32_out);
+    F("gdn.norm_eps_override", cfg.gdn.norm_eps_override);
+    S("gdn.layout_override", cfg.gdn.layout_override);
+    B("gdn.ref_kernel", cfg.gdn.ref_kernel);
+    B("gdn.vhead_reorder", cfg.gdn.vhead_reorder);
+    B("gdn.chunkwise_scan", cfg.gdn.chunkwise_scan);
+
+    // [gemm]
+    B("gemm.no_dp4a_gemv", cfg.gemm.no_dp4a_gemv);
+    B("gemm.no_dp4a_lm", cfg.gemm.no_dp4a_lm);
+    B("gemm.no_mmvq", cfg.gemm.no_mmvq);
+    B("gemm.no_mmvq_q8_0", cfg.gemm.no_mmvq_q8_0);
+    B("gemm.q4k_hmma_enabled", cfg.gemm.q4k_hmma_enabled);
+    B("gemm.q8_imma_enabled", cfg.gemm.q8_imma_enabled);
+    B("gemm.q4k_imma_prefill", cfg.gemm.q4k_imma_prefill);
+    B("gemm.moe_imma_prefill", cfg.gemm.moe_imma_prefill);
+    B("gemm.nvfp4_decode_all", cfg.gemm.nvfp4_decode_all);
+    S("gemm.nvfp4_lm_head", cfg.gemm.nvfp4_lm_head);
+    if (!matched && dotted_key == "gemm.cublas_fp16_acc") {
+        // tri-state auto|on|off; legacy bool spellings stay valid
+        if (val == "auto" || val == "on" || val == "off")
+            cfg.gemm.cublas_fp16_acc = val;
+        else
+            cfg.gemm.cublas_fp16_acc = parse_bool(val, false) ? "on" : "off";
+        matched = true;
+    }
+    B("gemm.nvfp4_lm_head_gdn", cfg.gemm.nvfp4_lm_head_gdn);
+    B("gemm.nvfp4_lm_head_cutlass", cfg.gemm.nvfp4_lm_head_cutlass);
+    B("gemm.nvfp4_attn_proj", cfg.gemm.nvfp4_attn_proj);
+    B("gemm.fp8_ssm_proj", cfg.gemm.fp8_ssm_proj);
+    S("gemm.fp8_attn_proj", cfg.gemm.fp8_attn_proj);
+    B("gemm.nvfp4_moe_decode", cfg.gemm.nvfp4_moe_decode);
+
+    // [gemma4] knobs live in ModelConfig::Overrides::Gemma4.
+    // Per-model knobs do not live
+    // on the global RuntimeConfig — they are populated by the
+    // GGUF / SafeTensors loader or the engine init resolver onto the model.
+
+    // [generation]
+    B("generation.no_logit_softcap", cfg.generation.no_logit_softcap);
+    B("generation.lm_dequant_fp16", cfg.generation.lm_dequant_fp16);
+    B("generation.force_bos", cfg.generation.force_bos);
+    B("generation.no_ban", cfg.generation.no_ban);
+    B("generation.mtp_no_rope", cfg.generation.mtp_no_rope);
+
+    // [server]
+    B("server.prefix_cache", cfg.server.prefix_cache);
+    I("server.prefix_pin_budget_pct", cfg.server.prefix_pin_budget_pct);
+    B("server.model_swap", cfg.server.model_swap);
+    I("server.model_swap_drain_ms", cfg.server.model_swap_drain_ms);
+    I("server.recurrent_snapshot_mb", cfg.server.recurrent_snapshot_mb);
+    B("server.green_contexts", cfg.server.green_contexts);
+
+    // [warm_cache]
+    B("warm_cache.enabled", cfg.warm_cache.enabled);
+    S("warm_cache.dir", cfg.warm_cache.dir);
+
+    // [suspend]
+    B("suspend.device_reset", cfg.suspend.device_reset);
+    I("suspend.host_ram_headroom_mb", cfg.suspend.host_ram_headroom_mb);
+
+    // [bench]
+    B("bench.generate", cfg.bench.generate);
+
+    // [paths]
+    S("paths.mmproj", cfg.paths.mmproj);
+
+    // [diagnostics]
+    S("diagnostics.log_level", cfg.diagnostics.log_level);
+    B("diagnostics.debug_forward", cfg.diagnostics.debug_forward);
+    B("diagnostics.debug_template", cfg.diagnostics.debug_template);
+    S("diagnostics.dump_hidden_dir", cfg.diagnostics.dump_hidden_dir);
+    S("diagnostics.dump_logits_dir", cfg.diagnostics.dump_logits_dir);
+    S("diagnostics.dump_routing_dir", cfg.diagnostics.dump_routing_dir);
+    B("diagnostics.dump_tokens", cfg.diagnostics.dump_tokens);
+    I("diagnostics.ppl_first", cfg.diagnostics.ppl_first);
+    I("diagnostics.ppl_last", cfg.diagnostics.ppl_last);
+    I("diagnostics.exit_layer", cfg.diagnostics.exit_layer);
+    B("diagnostics.profile", cfg.diagnostics.profile);
+    B("diagnostics.graph_diag", cfg.diagnostics.graph_diag);
+    S("diagnostics.graph_dump_dir", cfg.diagnostics.graph_dump_dir);
+    B("diagnostics.nvfp4_force_dequant", cfg.diagnostics.nvfp4_force_dequant);
+    B("diagnostics.no_nvfp4_decode_cache", cfg.diagnostics.no_nvfp4_decode_cache);
+    B("diagnostics.spec_capture_probe", cfg.diagnostics.spec_capture_probe);
+    B("diagnostics.log_gemm_algo", cfg.diagnostics.log_gemm_algo);
+    B("diagnostics.mtp_pattern_log", cfg.diagnostics.mtp_pattern_log);
+    B("diagnostics.mtp_prenorm_h", cfg.diagnostics.mtp_prenorm_h);
+    B("diagnostics.audit_nvfp4_scales", cfg.diagnostics.audit_nvfp4_scales);
+    B("diagnostics.vram_audit", cfg.diagnostics.vram_audit);
+    S("diagnostics.vram_audit_dump", cfg.diagnostics.vram_audit_dump);
+
+    // [calibration]
+    B("calibration.enabled", cfg.calibration.enabled);
+    S("calibration.out_path", cfg.calibration.out_path);
+
+    // [constrained]
+    B("constrained.jump_ahead", cfg.constrained.jump_ahead);
+    I("constrained.jump_min_run", cfg.constrained.jump_min_run);
+
+    // [ffn]
+    B("ffn.sparsity_probe", cfg.ffn.sparsity_probe);
+    F("ffn.sparsity_threshold", cfg.ffn.sparsity_threshold);
+
+    // [speculative]
+    B("speculative.ngram", cfg.speculative.ngram);
+    I("speculative.draft_ctx_cap", cfg.speculative.draft_ctx_cap);
+    I("speculative.shallow_draft_ctx", cfg.speculative.shallow_draft_ctx);
+    B("speculative.verify_decode_attn", cfg.speculative.verify_decode_attn);
+    B("speculative.verify_nvfp4_gemm", cfg.speculative.verify_nvfp4_gemm);
+    B("speculative.moe", cfg.speculative.moe);
+    I("speculative.k", cfg.speculative.k);
+    B("speculative.token_recycling", cfg.speculative.token_recycling);
+    I("speculative.recycle_slots", cfg.speculative.recycle_slots);
+    I("speculative.recycle_depth", cfg.speculative.recycle_depth);
+    I("speculative.recycle_width", cfg.speculative.recycle_width);
+    I("speculative.recycle_min_streak", cfg.speculative.recycle_min_streak);
+    B("speculative.suffix", cfg.speculative.suffix);
+    I("speculative.suffix_k_max", cfg.speculative.suffix_k_max);
+    I("speculative.min_match", cfg.speculative.min_match);
+    I("speculative.max_match", cfg.speculative.max_match);
+    I("speculative.give_up_after", cfg.speculative.give_up_after);
+    I("speculative.burst", cfg.speculative.burst);
+    I("speculative.miss_burst", cfg.speculative.miss_burst);
+    B("speculative.burst_rearm", cfg.speculative.burst_rearm);
+    B("speculative.hybrid", cfg.speculative.hybrid);
+    I("speculative.mtp_k", cfg.speculative.mtp_k);
+    B("speculative.mtp_nvfp4_head", cfg.speculative.mtp_nvfp4_head);
+    F("speculative.mtp_econ_min_emit", cfg.speculative.mtp_econ_min_emit);
+    B("speculative.capture", cfg.speculative.capture);
+    I("speculative.capture_ctx_cap", cfg.speculative.capture_ctx_cap);
+
+    return matched;
+}
+
+bool file_exists(const std::string& path) {
+    if (path.empty())
+        return false;
+    struct stat st {};
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string home_dir() {
+    if (const char* h = std::getenv("HOME"))
+        return h;
+    if (struct passwd* pw = getpwuid(getuid()))
+        return pw->pw_dir;
+    return {};
+}
+
+// Env seeding, deliberately minimal. quench.conf + --set is the config
+// surface, not a sprawling QUENCH_* env surface;
+// only the two vars with real in-repo producers are seeded:
+//   QUENCH_DETERMINISTIC — set by tests (test_determinism_e2e, test_lora) to
+//     inject determinism through the public API without a config file.
+//   QUENCH_FMHA_FA2 — set by the roofline A/B harness (tools/roofline/roofline.py)
+//     to toggle the FA2 prefill kernel per subprocess.
+// Three trace vars are also seeded here (QUENCH_SPEC_TRACE, QUENCH_JUMP_TRACE,
+// QUENCH_PPL_DUMP). Raw getenv() calls at their use sites would be
+// unreachable from quench.conf/--set and undocumented. Seeding keeps the shell
+// habit working while making the keys first-class.
+void seed_from_env(RuntimeConfig& cfg) {
+    // runtime.deterministic — QUENCH_DETERMINISTIC: '1'/'true' enables full
+    // reproducibility (also implies deterministic_gemm).
+    if (const char* e = std::getenv("QUENCH_DETERMINISTIC")) {
+        cfg.runtime.deterministic = parse_bool(e, cfg.runtime.deterministic);
+        if (cfg.runtime.deterministic)
+            cfg.runtime.deterministic_gemm = true;
+    }
+
+    // attention.fmha_fa2 — QUENCH_FMHA_FA2: '1' enables the register-resident FA2
+    // prefill kernel (A/B vs the legacy FP8 FMHA), '0' forces it off.
+    if (const char* e = std::getenv("QUENCH_FMHA_FA2"))
+        cfg.attention.fmha_fa2 = (std::atoi(e) != 0) ? "on" : "never";
+
+    // diagnostics.spec_trace / jump_trace / ppl_dump — presence-is-truth for the
+    // two booleans (an
+    // empty value counts as ON, matching the `if (getenv(...))` shell habit).
+    if (std::getenv("QUENCH_SPEC_TRACE"))
+        cfg.diagnostics.spec_trace = true;
+    if (std::getenv("QUENCH_JUMP_TRACE"))
+        cfg.diagnostics.jump_trace = true;
+    if (const char* e = std::getenv("QUENCH_PPL_DUMP"))
+        cfg.diagnostics.ppl_dump = e;
+}
+
+}  // anonymous namespace
+
+// -----------------------------------------------------------------------
+
+std::string RuntimeConfig::find_default_path() {
+    if (const char* p = std::getenv("QUENCH_CONFIG")) {
+        if (file_exists(p))
+            return p;
+    }
+    if (file_exists("./quench.conf"))
+        return "./quench.conf";
+    std::string home = home_dir();
+    if (!home.empty()) {
+        std::string user_path = home + "/.config/quench/quench.conf";
+        if (file_exists(user_path))
+            return user_path;
+    }
+    return {};
+}
+
+bool RuntimeConfig::load_from_file(const std::string& path) {
+    std::ifstream ifs(path);
+    if (!ifs) {
+        QUENCH_LOG_ERROR("quench.conf: cannot open %s", path.c_str());
+        return false;
+    }
+
+    std::string line;
+    std::string section;
+    int line_no = 0;
+    while (std::getline(ifs, line)) {
+        ++line_no;
+        // Strip comment from '#' onwards (unless inside quotes — we ignore that
+        // edge case for the minimal parser; quote a value with " to keep #).
+        size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            // Don't strip if inside quotes
+            size_t q1 = line.find('"');
+            size_t q2 = (q1 == std::string::npos) ? std::string::npos : line.find('"', q1 + 1);
+            if (!(q1 != std::string::npos && q2 != std::string::npos && q1 < hash && hash < q2)) {
+                line = line.substr(0, hash);
+            }
+        }
+        std::string s = trim(line);
+        if (s.empty())
+            continue;
+
+        if (s.front() == '[' && s.back() == ']') {
+            section = trim(s.substr(1, s.size() - 2));
+            continue;
+        }
+
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) {
+            QUENCH_LOG_WARN("quench.conf:%d: ignoring malformed line: %s", line_no, s.c_str());
+            continue;
+        }
+        std::string key = trim(s.substr(0, eq));
+        std::string val = trim(s.substr(eq + 1));
+
+        std::string dotted = key;
+        if (!section.empty()) {
+            dotted = section;
+            dotted += '.';
+            dotted += key;
+        }
+        if (!apply_one(*this, dotted, val))
+            QUENCH_LOG_WARN("quench.conf: unknown key '%s' (value '%s') — ignoring", dotted.c_str(), val.c_str());
+    }
+    return true;
+}
+
+std::vector<std::string> RuntimeConfig::apply_overrides(const std::vector<std::string>& kvs) {
+    std::vector<std::string> rejected;
+    for (const auto& kv : kvs) {
+        size_t eq = kv.find('=');
+        if (eq == std::string::npos) {
+            rejected.push_back(kv + "  (expected key=value)");
+            continue;
+        }
+        std::string key = trim(kv.substr(0, eq));
+        std::string val = trim(kv.substr(eq + 1));
+        if (!apply_one(*this, key, val))
+            rejected.push_back(kv + "  (no such key)");
+    }
+    return rejected;
+}
+
+RuntimeConfig RuntimeConfig::load(const std::string& explicit_path,
+                                  const std::vector<std::string>& overrides,
+                                  std::vector<std::string>* rejected) {
+    RuntimeConfig cfg;
+    // Seed legacy QUENCH_* env vars first; file values + CLI overrides win on top.
+    seed_from_env(cfg);
+    std::string path = explicit_path.empty() ? find_default_path() : explicit_path;
+    if (!path.empty()) {
+        if (cfg.load_from_file(path)) {
+            QUENCH_LOG_INFO("quench.conf loaded from %s", path.c_str());
+        }
+    } else {
+        QUENCH_LOG_INFO("quench.conf: no config file found, using built-in defaults");
+    }
+    std::vector<std::string> bad = cfg.apply_overrides(overrides);
+    if (rejected != nullptr)
+        *rejected = std::move(bad);
+    else
+        for (const auto& b : bad)
+            QUENCH_LOG_WARN("config override rejected: %s", b.c_str());
+    return cfg;
+}
+
+// ---- Pending-config handoff (tool main → Engine::init) ------------------
+//
+// There is deliberately no process-wide singleton. The static storage lives
+// for at most one Engine construction: tool main stashes the loaded
+// config via set_pending_runtime_config(); quench_context_create() takes
+// it via take_pending_runtime_config() and hands it to Engine::init.
+// If the take() call finds no pending config (library users that never
+// called the setter), it returns a freshly loaded RuntimeConfig (with
+// the seed_from_env() QUENCH_* path) so library users get the same
+// config-file + env defaults as tool mains.
+
+namespace {
+RuntimeConfig& pending_slot() {
+    static RuntimeConfig slot;
+    return slot;
+}
+bool& pending_set() {
+    static bool b = false;
+    return b;
+}
+}  // anonymous namespace
+
+void set_pending_runtime_config(RuntimeConfig cfg) {
+    pending_slot() = std::move(cfg);
+    pending_set() = true;
+}
+
+RuntimeConfig take_pending_runtime_config() {
+    if (pending_set()) {
+        pending_set() = false;
+        return std::move(pending_slot());
+    }
+    // No tool-main install — fall back to env-seeded defaults so tests
+    // and library users that skip RuntimeConfig::load() still observe
+    // legacy QUENCH_* env values.
+    RuntimeConfig cfg;
+    seed_from_env(cfg);
+    return cfg;
+}
+
+}  // namespace quench

@@ -1,0 +1,60 @@
+# clang-tidy for quench — host C++ static analysis.
+#
+# SCOPE: host .cpp / .h translation units. clang-tidy cannot parse CUDA .cu files
+# without a full nvcc-equivalent flagset, so `make tidy` and the CI lint job run
+# it over the non-.cu TUs from compile_commands.json (built with the host C++
+# compiler). For IDEs, clangd picks this file up automatically.
+#
+# Advisory: WarningsAsErrors is empty, so findings surface but do not block. The
+# disabled checks below are calibrated against a full sweep (it reported ~2000
+# findings, ~85% of them low-value style churn). We keep the bugprone-* /
+# performance-* / clang-diagnostic-* signal and drop the cosmetic mass (const on
+# locals, literal-suffix case, anon-namespace style, branch-clone on intentional
+# explicit case enumerations, …) so the gate surfaces real issues, not noise.
+#
+# Two bugprone-* checks are also disabled as verified FALSE POSITIVES here:
+#   - unchecked-optional-access: every hit is guarded by has_value() in the same
+#     short-circuit (e.g. `!m->opt_.has_value() || !m->opt_->loaded`); the
+#     dataflow can't track the guard through the `m->opt_->` pointer-member chain.
+#   - signed-char-misuse: the hits are deliberate int8_t reads (GGUF/vision
+#     metadata) where sign extension to int64 is the intended behavior.
+# (Intentional empty catches — try-parse-with-default — are left flagged; the
+#  bugprone-empty-catch check stays on as a guard for genuinely-new swallows.)
+
+Checks: >
+  bugprone-*,
+  performance-*,
+  misc-*,
+  readability-*,
+  cppcoreguidelines-pro-type-cstyle-cast,
+  cppcoreguidelines-pro-type-member-init,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-branch-clone,
+  -bugprone-unchecked-optional-access,
+  -bugprone-signed-char-misuse,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -misc-include-cleaner,
+  -misc-const-correctness,
+  -misc-use-anonymous-namespace,
+  -performance-enum-size,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-braces-around-statements,
+  -readability-implicit-bool-conversion,
+  -readability-named-parameter,
+  -readability-isolate-declaration,
+  -readability-uppercase-literal-suffix,
+  -readability-qualified-auto,
+  -readability-static-definition-in-anonymous-namespace,
+  -readability-avoid-nested-conditional-operator,
+  -readability-use-anyofallof,
+  -readability-else-after-return,
+  -readability-redundant-member-init,
+  -readability-simplify-boolean-expr
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '(src|include/quench)/.*\.(h|hpp)$'
+FormatStyle: file

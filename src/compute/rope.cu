@@ -1,0 +1,405 @@
+#include "compute/rope.h"
+#include "compute/rope_yarn.cuh"
+#include "compute/warp_reduce.cuh"
+#include "runtime/pdl.h"
+#include "core/tensor.h"
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+#include <cmath>
+
+namespace quench {
+
+// YaRN device helpers (rope_yarn_ramp / rope_yarn) live in compute/rope_yarn.cuh,
+// shared with the MTP draft head so the two rope paths cannot drift (issue).
+
+// --------------------------------------------------------------------------
+// RoPE element access traits: abstracts FP32 (direct) vs FP16 (convert)
+// --------------------------------------------------------------------------
+template <typename T>
+struct RopeTraits;
+
+template <>
+struct RopeTraits<float> {
+    static __device__ __forceinline__ float load(const float* ptr, int64_t idx) { return ptr[idx]; }
+    static __device__ __forceinline__ void store(float* ptr, int64_t idx, float val) { ptr[idx] = val; }
+};
+
+template <>
+struct RopeTraits<__half> {
+    static __device__ __forceinline__ float load(const __half* ptr, int64_t idx) {
+        return __half2float(ptr[idx]);
+    }
+    static __device__ __forceinline__ void store(__half* ptr, int64_t idx, float val) {
+        ptr[idx] = __float2half(val);
+    }
+};
+
+// Which position axis drives this rotary pair. Returns `fallback` unchanged
+// when M-RoPE is off, so the single-axis path keeps computing exactly what it
+// computed before.
+__device__ __forceinline__ int mrope_position(const MRopeParams& m, int fallback, int pair_idx,
+                                              int token_idx) {
+    if (!m.positions)
+        return fallback + (m.pos_delta ? m.pos_delta[token_idx] : 0);
+    int axis;
+    if (m.interleaved) {
+        const int r = pair_idx % 3;
+        if (r == 1 && pair_idx < 3 * m.sec_h)
+            axis = 1;
+        else if (r == 2 && pair_idx < 3 * m.sec_w)
+            axis = 2;
+        else
+            axis = 0;
+    } else {
+        axis = (pair_idx < m.sec_t) ? 0 : (pair_idx < m.sec_t + m.sec_h) ? 1 : 2;
+    }
+    return m.positions[static_cast<int64_t>(axis) * m.stride + token_idx];
+}
+
+// --------------------------------------------------------------------------
+// Unified RoPE kernel with YaRN support (FP32 and FP16 via template)
+// --------------------------------------------------------------------------
+template <typename T>
+__global__ void rope_forward_kernel(T* __restrict__ Q, T* __restrict__ K, const int* __restrict__ positions,
+                                    int batch, int seq_len, int n_heads, int n_kv_heads, int head_dim,
+                                    float theta, float inv_scaling, int rope_pairs, bool neox,
+                                    float ext_factor, float attn_factor, float corr_dim_0, float corr_dim_1,
+                                    const float* __restrict__ longrope_inv_freqs, MRopeParams mrope) {
+    using Traits = RopeTraits<T>;
+
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int pair_idx = threadIdx.x;
+
+    if (pair_idx >= rope_pairs)
+        return;
+
+    const int pos = mrope_position(mrope, positions[token_idx], pair_idx, token_idx);
+
+    float cos_val, sin_val;
+    if (longrope_inv_freqs) {
+        // Pre-computed effective frequencies (base_freq/divisor already applied in gguf_loader).
+        // longrope_inv_freqs[i] = theta^(-2i/hd) / freq_divisor[i], ready to use directly.
+        float angle = static_cast<float>(pos) * longrope_inv_freqs[pair_idx];
+        cos_val = __cosf(angle);
+        sin_val = __sinf(angle);
+    } else if (ext_factor != 0.0f) {
+        // YaRN mode: per-dimension frequency blending
+        float theta_extrap = static_cast<float>(pos) /
+                             powf(theta, (2.0f * pair_idx) / static_cast<float>(2 * rope_pairs));
+        rope_yarn(theta_extrap, inv_scaling, corr_dim_0, corr_dim_1, 2 * pair_idx, ext_factor, attn_factor,
+                  cos_val, sin_val);
+    } else {
+        // Linear mode: simple frequency * inv_scaling
+        // Use rope_pairs*2 (=rope_dim) as denominator, not head_dim.
+        // For partial RoPE (rope_dim < head_dim), the base frequency spacing
+        // is determined by rope_dim, not the full head dimension.
+        float freq = 1.0f / powf(theta, (2.0f * pair_idx) / static_cast<float>(2 * rope_pairs));
+        freq *= inv_scaling;
+        float angle = static_cast<float>(pos) * freq;
+        cos_val = __cosf(angle);
+        sin_val = __sinf(angle);
+    }
+
+    // neox pair layout for partial RoPE: pair = (i, i + rope_pairs) — both
+    // indices are within the first `rope_dim = 2*rope_pairs` dimensions of the
+    // head. Matches llama.cpp ggml_rope_neox / LLAMA_ROPE_TYPE_IMROPE, which
+    // read x1 = x[ix + n_dims/2] where n_dims is the RoPE dimension count
+    // (64 for Qwen 3.5/3.6), NOT the full head_dim (256). Dims
+    // [rope_dim, head_dim) stay unchanged.
+    const int idx0 = neox ? pair_idx : (2 * pair_idx);
+    const int idx1 = neox ? (pair_idx + rope_pairs) : (2 * pair_idx + 1);
+
+    if (head_idx < n_heads) {
+        int64_t base = static_cast<int64_t>(token_idx) * n_heads * head_dim +
+                       static_cast<int64_t>(head_idx) * head_dim;
+        float q0 = Traits::load(Q, base + idx0);
+        float q1 = Traits::load(Q, base + idx1);
+        Traits::store(Q, base + idx0, q0 * cos_val - q1 * sin_val);
+        Traits::store(Q, base + idx1, q0 * sin_val + q1 * cos_val);
+    }
+
+    if (head_idx < n_kv_heads) {
+        int64_t base = static_cast<int64_t>(token_idx) * n_kv_heads * head_dim +
+                       static_cast<int64_t>(head_idx) * head_dim;
+        float k0 = Traits::load(K, base + idx0);
+        float k1 = Traits::load(K, base + idx1);
+        Traits::store(K, base + idx0, k0 * cos_val - k1 * sin_val);
+        Traits::store(K, base + idx1, k0 * sin_val + k1 * cos_val);
+    }
+}
+
+// Explicit template instantiations
+template __global__ void rope_forward_kernel<float>(float*, float*, const int*, int, int, int, int, int,
+                                                    float, float, int, bool, float, float, float, float,
+                                                    const float*, MRopeParams);
+template __global__ void rope_forward_kernel<__half>(__half*, __half*, const int*, int, int, int, int, int,
+                                                     float, float, int, bool, float, float, float, float,
+                                                     const float*, MRopeParams);
+
+// --------------------------------------------------------------------------
+// Host dispatch
+// --------------------------------------------------------------------------
+void rope_forward(Tensor& Q, Tensor& K, const int* positions, int head_dim, float theta, float scaling,
+                  int rope_dim, bool neox, float ext_factor, float attn_factor, const float* corr_dims,
+                  cudaStream_t stream, const float* longrope_inv_freqs, MRopeParams mrope) {
+    const int batch = static_cast<int>(Q.shape[0]);
+    const int seq_len = static_cast<int>(Q.shape[1]);
+    const int n_heads = static_cast<int>(Q.shape[2]);
+    const int n_kv_heads = static_cast<int>(K.shape[2]);
+    const int total_tokens = batch * seq_len;
+    const int max_heads = (n_heads > n_kv_heads) ? n_heads : n_kv_heads;
+
+    if (total_tokens == 0 || head_dim == 0)
+        return;
+
+    const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+    const int pairs = effective_rope_dim / 2;
+    const int block_x = (pairs <= 512) ? pairs : 512;
+
+    dim3 grid(total_tokens, max_heads);
+    dim3 block(block_x);
+
+    const float inv_scaling = 1.0f / scaling;
+    float cd0 = 0.0f, cd1 = 0.0f;
+    if (corr_dims) {
+        cd0 = corr_dims[0];
+        cd1 = corr_dims[1];
+    }
+
+    switch (Q.qtype) {
+        case QType::F32:
+            pdl::launch(rope_forward_kernel<float>, grid, block, 0, stream, static_cast<float*>(Q.data),
+                        static_cast<float*>(K.data), positions, batch, seq_len, n_heads, n_kv_heads, head_dim,
+                        theta, inv_scaling, pairs, neox, ext_factor, attn_factor, cd0, cd1,
+                        longrope_inv_freqs, mrope);
+            break;
+        case QType::F16:
+            pdl::launch(rope_forward_kernel<__half>, grid, block, 0, stream, static_cast<__half*>(Q.data),
+                        static_cast<__half*>(K.data), positions, batch, seq_len, n_heads, n_kv_heads,
+                        head_dim, theta, inv_scaling, pairs, neox, ext_factor, attn_factor, cd0, cd1,
+                        longrope_inv_freqs, mrope);
+            break;
+        default:
+            break;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fused QK-norm + RoPE kernel (decode-only, n=1, FP16) with YaRN support
+// --------------------------------------------------------------------------
+
+// Use centralized warp_reduce_sum from warp_reduce.cuh
+
+__device__ __forceinline__ float rope_block_reduce_sum(float val, float* shared_buf) {
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+
+    val = warp_reduce_sum(val);
+    if (lane == 0)
+        shared_buf[warp_id] = val;
+    __syncthreads();
+
+    const int num_warps = (blockDim.x + 31) / 32;
+    val = (threadIdx.x < num_warps) ? shared_buf[threadIdx.x] : 0.0f;
+    if (warp_id == 0)
+        val = warp_reduce_sum(val);
+    return val;
+}
+
+__global__ void qknorm_rope_fused_fp16_kernel(
+    __half* __restrict__ Q, __half* __restrict__ K, const __half* __restrict__ q_norm_w,
+    const __half* __restrict__ k_norm_w, const int* __restrict__ positions, int n_heads, int n_kv_heads,
+    int head_dim, float eps, float theta, float inv_scaling, int rope_pairs, bool neox, float weight_offset,
+    float ext_factor, float attn_factor, float corr_dim_0, float corr_dim_1,
+    const float* __restrict__ longrope_inv_freqs, MRopeParams mrope) {
+    const int head_idx = blockIdx.x;
+    const int pos_text = positions[0];
+
+    extern __shared__ float smem[];
+    float* reduce_buf = smem;
+    float* normed_vals = smem + 8;
+
+    // --- Process Q head ---
+    if (head_idx < n_heads) {
+        __half* q_head = Q + head_idx * head_dim;
+
+        float sum_sq = 0.0f;
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(q_head[i]);
+            sum_sq += v * v;
+        }
+        sum_sq = rope_block_reduce_sum(sum_sq, reduce_buf);
+
+        float inv_rms;
+        if (threadIdx.x == 0) {
+            reduce_buf[0] = rsqrtf(sum_sq / (float)head_dim + eps);
+        }
+        __syncthreads();
+        inv_rms = reduce_buf[0];
+
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(q_head[i]);
+            float w = __half2float(q_norm_w[i]) + weight_offset;
+            normed_vals[i] = v * inv_rms * w;
+        }
+        __syncthreads();
+
+        for (int pair = threadIdx.x; pair < rope_pairs; pair += blockDim.x) {
+            // Decode runs one token, so the axis rows are single entries.
+            const int pos = mrope_position(mrope, pos_text, pair, 0);
+            float cos_val, sin_val;
+            if (longrope_inv_freqs) {
+                // Pre-computed effective frequencies (see gguf_loader.cpp rope_freqs conversion)
+                float angle = (float)pos * longrope_inv_freqs[pair];
+                cos_val = __cosf(angle);
+                sin_val = __sinf(angle);
+            } else if (ext_factor != 0.0f) {
+                float theta_extrap = (float)pos / powf(theta, (2.0f * pair) / (float)(2 * rope_pairs));
+                rope_yarn(theta_extrap, inv_scaling, corr_dim_0, corr_dim_1, 2 * pair, ext_factor,
+                          attn_factor, cos_val, sin_val);
+            } else {
+                float freq = 1.0f / powf(theta, (2.0f * pair) / (float)(2 * rope_pairs)) * inv_scaling;
+                float angle = (float)pos * freq;
+                cos_val = __cosf(angle);
+                sin_val = __sinf(angle);
+            }
+
+            int idx0 = neox ? pair : (2 * pair);
+            int idx1 = neox ? (pair + rope_pairs) : (2 * pair + 1);
+
+            float q0 = normed_vals[idx0];
+            float q1 = normed_vals[idx1];
+            q_head[idx0] = __float2half(q0 * cos_val - q1 * sin_val);
+            q_head[idx1] = __float2half(q0 * sin_val + q1 * cos_val);
+        }
+        // Copy back non-rotated dims. For partial RoPE (rope_dim < head_dim),
+        // rotation pairs (i, i+rope_pairs) are within [0, 2*rope_pairs); dims
+        // [2*rope_pairs, head_dim) stay unchanged. This matches the layout
+        // used by llama.cpp's rope_neox kernel.
+        for (int i = 2 * rope_pairs + threadIdx.x; i < head_dim; i += blockDim.x) {
+            q_head[i] = __float2half(normed_vals[i]);
+        }
+    }
+
+    __syncthreads();
+
+    // --- Process K head ---
+    if (head_idx < n_kv_heads) {
+        __half* k_head = K + head_idx * head_dim;
+
+        float sum_sq = 0.0f;
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(k_head[i]);
+            sum_sq += v * v;
+        }
+        sum_sq = rope_block_reduce_sum(sum_sq, reduce_buf);
+
+        float inv_rms;
+        if (threadIdx.x == 0) {
+            reduce_buf[0] = rsqrtf(sum_sq / (float)head_dim + eps);
+        }
+        __syncthreads();
+        inv_rms = reduce_buf[0];
+
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(k_head[i]);
+            float w = __half2float(k_norm_w[i]) + weight_offset;
+            normed_vals[i] = v * inv_rms * w;
+        }
+        __syncthreads();
+
+        for (int pair = threadIdx.x; pair < rope_pairs; pair += blockDim.x) {
+            // Decode runs one token, so the axis rows are single entries.
+            const int pos = mrope_position(mrope, pos_text, pair, 0);
+            float cos_val, sin_val;
+            if (longrope_inv_freqs) {
+                // Pre-computed effective frequencies (see gguf_loader.cpp rope_freqs conversion)
+                float angle = (float)pos * longrope_inv_freqs[pair];
+                cos_val = __cosf(angle);
+                sin_val = __sinf(angle);
+            } else if (ext_factor != 0.0f) {
+                float theta_extrap = (float)pos / powf(theta, (2.0f * pair) / (float)(2 * rope_pairs));
+                rope_yarn(theta_extrap, inv_scaling, corr_dim_0, corr_dim_1, 2 * pair, ext_factor,
+                          attn_factor, cos_val, sin_val);
+            } else {
+                float freq = 1.0f / powf(theta, (2.0f * pair) / (float)(2 * rope_pairs)) * inv_scaling;
+                float angle = (float)pos * freq;
+                cos_val = __cosf(angle);
+                sin_val = __sinf(angle);
+            }
+
+            int idx0 = neox ? pair : (2 * pair);
+            int idx1 = neox ? (pair + rope_pairs) : (2 * pair + 1);
+
+            float k0 = normed_vals[idx0];
+            float k1 = normed_vals[idx1];
+            k_head[idx0] = __float2half(k0 * cos_val - k1 * sin_val);
+            k_head[idx1] = __float2half(k0 * sin_val + k1 * cos_val);
+        }
+        // Copy back non-rotated dims (see Q path comment above).
+        for (int i = 2 * rope_pairs + threadIdx.x; i < head_dim; i += blockDim.x) {
+            k_head[i] = __float2half(normed_vals[i]);
+        }
+    }
+}
+
+void qknorm_rope_fused(half* Q, half* K, const half* q_norm_weight, const half* k_norm_weight, int n_heads,
+                       int n_kv_heads, int head_dim, float eps, const int* positions, float theta,
+                       float scaling, int rope_dim, bool neox, cudaStream_t stream, float weight_offset,
+                       float ext_factor, float attn_factor, const float* corr_dims,
+                       const float* longrope_inv_freqs, MRopeParams mrope) {
+    const int max_heads = (n_heads > n_kv_heads) ? n_heads : n_kv_heads;
+    if (max_heads == 0 || head_dim == 0)
+        return;
+
+    const int effective_rope_dim = (rope_dim > 0) ? rope_dim : head_dim;
+    const int rope_pairs = effective_rope_dim / 2;
+    const float inv_scaling = 1.0f / scaling;
+
+    float cd0 = 0.0f, cd1 = 0.0f;
+    if (corr_dims) {
+        cd0 = corr_dims[0];
+        cd1 = corr_dims[1];
+    }
+
+    const int block_size = 128;
+    const int smem_bytes = (8 + head_dim) * sizeof(float);
+
+    pdl::launch(qknorm_rope_fused_fp16_kernel, dim3(max_heads), dim3(block_size), smem_bytes, stream,
+                reinterpret_cast<__half*>(Q), reinterpret_cast<__half*>(K),
+                reinterpret_cast<const __half*>(q_norm_weight),
+                reinterpret_cast<const __half*>(k_norm_weight), positions, n_heads, n_kv_heads, head_dim, eps,
+                theta, inv_scaling, rope_pairs, neox, weight_offset, ext_factor, attn_factor, cd0, cd1,
+                longrope_inv_freqs, mrope);
+}
+
+// --------------------------------------------------------------------------
+// YaRN correction dimensions computation (host-side)
+// --------------------------------------------------------------------------
+
+static float rope_yarn_corr_dim_impl(int n_dims, int n_ctx_orig, float n_rot, float base) {
+    return static_cast<float>(n_dims) *
+           logf(static_cast<float>(n_ctx_orig) / (n_rot * 2.0f * 3.14159265358979323846f)) /
+           (2.0f * logf(base));
+}
+
+void rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow,
+                         float dims[2]) {
+    float start = floorf(rope_yarn_corr_dim_impl(n_dims, n_ctx_orig, beta_fast, freq_base));
+    float end = ceilf(rope_yarn_corr_dim_impl(n_dims, n_ctx_orig, beta_slow, freq_base));
+    dims[0] = fmaxf(0.0f, start);
+    dims[1] = fminf(static_cast<float>(n_dims - 1), end);
+}
+
+// --------------------------------------------------------------------------
+// PDL registration
+// --------------------------------------------------------------------------
+void rope_pdl_register() {
+    pdl::enable(reinterpret_cast<const void*>(&rope_forward_kernel<__half>));
+    pdl::enable(reinterpret_cast<const void*>(&rope_forward_kernel<float>));
+    pdl::enable(reinterpret_cast<const void*>(&qknorm_rope_fused_fp16_kernel));
+}
+
+}  // namespace quench

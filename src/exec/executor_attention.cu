@@ -1,0 +1,777 @@
+#include "core/dispatch_policy.h"
+#include "exec/executor.h"
+#include <stdexcept>
+#include "lora/lora_adapter.h"
+#include "exec/executor_kernels.h"
+#include "exec/executor_helpers.h"
+#include "memory/kv_cache_manager.h"
+#include "exec/executor_gemv_helpers.h"
+#include "exec/executor_debug.h"
+#include "exec/gemm_context.h"
+#include "compute/embedding.h"
+#include "compute/layernorm.h"
+#include "compute/rope.h"
+#include "compute/gemm.h"
+#include "compute/gemm_grouped.h"
+#include "compute/gemm_moe_fused.h"
+#include "compute/gemm_moe_fused_tc.h"
+#include "compute/gemm_q6k.h"
+#include "compute/gemm_cutlass_sm120.h"
+#include "compute/activation.h"
+#include "compute/attention.h"
+#include "compute/attention_cublas.h"
+#include "compute/attention_fmha_sm120.h"
+#include "compute/attention_fmha_mxfp4_sm120.h"
+#include "compute/attention_paged.h"
+#include "compute/dispatch_record.h"  // resolved-path recording
+#include "compute/kv_gather.h"
+#include "compute/moe_routing.h"
+#include "compute/sampling.h"
+#include "compute/ssm.h"
+#include "compute/gdn.h"
+#include "quant/quant_gemm.h"
+#include "quant/dequant_gpu.h"
+#include "quant/fp8_quant.h"
+#include "quant/nvfp4_gemm.h"
+#include "quant/mxfp4_gemm.h"
+#include "compute/hadamard.h"
+#include "compute/mla_kv_assemble.h"
+#include "compute/mla_absorb.h"
+#include "core/logging.h"
+#include "memory/kv_cache.h"
+#include "runtime/pdl.h"
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
+#include <utility>
+
+#include "exec/executor_attention_internal.h"
+namespace quench {
+
+// File-local attention helpers moved to executor_attention_internal.h
+// (try_fa2_fp16qk_prefill, dispatch_gemv_qkv_fused, set_l2_persist_kv,
+//  clear_l2_persist) to keep this TU under the file-size gate.
+
+// ---------------------------------------------------------------------------
+// Attention sub-pass for one layer
+// ---------------------------------------------------------------------------
+
+void GraphExecutor::run_attention(int layer, const InferenceState& state, cudaStream_t stream) {
+    // Configure shared workspace for attention phase
+    configure_attn_workspace(ws_.shared_max_tokens());
+
+    const auto& cfg = model_->config();
+    const auto& prof = model_->profile();
+    using AttnVariant = ModelProfile::AttnVariant;
+    const auto& ly = model_->layer(layer);
+    int n = state.n_tokens;
+    int nh = cfg.n_heads;
+    // Per-layer head_dim / n_kv_heads (Gemma 4 dual geometry + Nemotron-H hybrid)
+    int nkv = (!cfg.n_kv_heads_per_layer.empty() && layer < (int)cfg.n_kv_heads_per_layer.size() &&
+               cfg.n_kv_heads_per_layer[layer] > 0)
+                  ? cfg.n_kv_heads_per_layer[layer]
+                  : cfg.n_kv_heads;
+    int hd = (!cfg.head_dim_per_layer.empty() && layer < (int)cfg.head_dim_per_layer.size() &&
+              cfg.head_dim_per_layer[layer] > 0)
+                 ? cfg.head_dim_per_layer[layer]
+                 : (cfg.head_dim > 0 ? cfg.head_dim : (cfg.d_model / nh));
+    // Gemma 4: derive per-layer n_heads and n_kv_heads from actual tensor shapes.
+    // Layer 0 (SWA) wq=[4096,2816] wk=[2048,2816] → 16 Q × hd=256, 8 KV × hd=256
+    // Layer 5 (Global) wq=[8192,2816] wk=[1024,2816] → 16 Q × hd=512, 2 KV × hd=512
+    // Authoritative source = the loaded tensor shapes; per-layer config can lag.
+    if (prof.is_gemma4 && hd > 0 && ly.wq.data != nullptr) {
+        int wq_out = static_cast<int>(ly.wq.shape[0]);
+        if (wq_out > 0 && (wq_out % hd) == 0) {
+            int nh_layer = wq_out / hd;
+            if (nh_layer > 0 && nh_layer != nh)
+                nh = nh_layer;
+        }
+        if (ly.wk.data != nullptr) {
+            int wk_out = static_cast<int>(ly.wk.shape[0]);
+            if (wk_out > 0 && (wk_out % hd) == 0) {
+                int nkv_layer = wk_out / hd;
+                if (nkv_layer > 0 && nkv_layer != nkv)
+                    nkv = nkv_layer;
+            }
+        }
+    }
+    float eps = cfg.rms_norm_eps;
+
+    // Sized views for this call (never mutates member tensors).
+    Tensor h = view_tokens(hidden_, n);
+    Tensor r = view_tokens(residual_, n);
+    Tensor no = view_tokens(norm_out_, n);
+
+    // Qwen3.5 attention: Q projection has ×2 output (Q + output_gate fused).
+    // Detect by checking if wq output dim > n_heads * head_dim.
+    int q_out_dim = static_cast<int>(ly.wq.shape[0]);
+    bool has_attn_output_gate = (q_out_dim > nh * hd);
+    int q_actual_dim = nh * hd;  // actual Q dimension (without gate)
+
+    Tensor qv = view_tokens(q_, n);
+    Tensor kk = view_tokens(k_, n);
+    Tensor vv = view_tokens(v_, n);
+    Tensor ao = view_tokens(attn_out_, n);
+    Tensor po = view_tokens(proj_out_, n);
+
+    const bool per_layer_shapes = (!cfg.head_dim_per_layer.empty() || !cfg.n_kv_heads_per_layer.empty());
+
+    // Per-layer shape narrowing: Q/K/V/ao workspace tensors are allocated with
+    // max shapes (for worst-case layer). For layers with smaller head_dim (Gemma 4
+    // SWA), narrow the view so cuBLAS gemm writes with the correct leading dim.
+    if (per_layer_shapes) {
+        auto narrow_cols = [](Tensor& t, int64_t new_cols) {
+            if (t.shape[1] != new_cols) {
+                t.shape[1] = new_cols;
+                t.compute_strides();
+            }
+        };
+        narrow_cols(qv, static_cast<int64_t>(nh) * hd);
+        narrow_cols(kk, static_cast<int64_t>(nkv) * hd);
+        narrow_cols(vv, static_cast<int64_t>(nkv) * hd);
+        narrow_cols(ao, static_cast<int64_t>(nh) * hd);
+    }
+
+    // For Qwen3.5 attention output gate: allocate larger Q buffer AFTER all
+    // standard attention buffers to avoid overlap (q_/k_/v_/attn_out_/proj_out_
+    // all share the same ws_.shared() memory).
+    Tensor qv_full;
+    if (has_attn_output_gate) {
+        auto align256 = [](size_t x) -> size_t { return (x + 255) & ~size_t(255); };
+        size_t es_a = dtype_size(compute_dtype_);
+        // Place after proj_out_ (last standard buffer)
+        char* after_proj = static_cast<char*>(po.data) +
+                           align256(static_cast<size_t>(n) * cfg.d_model * es_a);
+        int64_t qfull_shape[2] = {static_cast<int64_t>(n), static_cast<int64_t>(q_out_dim)};
+        qv_full = Tensor(after_proj, compute_dtype_, 2, qfull_shape, true);
+    }
+
+    // Per-step diagnostics for n>1 decode debugging (layer 0 only)
+    bool debug_attn_steps = (layer == 0 && n > 1 && debug_forward_enabled());
+    if (debug_attn_steps) {
+        debug_tensor_stats("L0_step0_h_input", h, stream);
+    }
+
+    // 1. Save residual for later add-back.
+    //    Optimization: for decode (n=1) with dp4a, fuse residual into GEMV.
+    //    For prefill (n>1) with FP16 cache, use cuBLAS beta=1 to fuse residual
+    //    into the wo projection GEMM — no separate residual save/add/copy needed.
+    //    For FP32 accumulator path: residual is kept in fp32_hidden_, skip FP16 copy.
+    // True sandwich norm: post_attn_norm applied inside run_attention AND separate
+    // ffn_norm for run_ffn (Gemma-3 pattern). When ffn_norm is absent (Qwen3.5),
+    // post_attn_norm serves as FFN input norm in run_ffn — NOT a sandwich norm.
+    // Without this check, post_attn_norm is applied TWICE (here + run_ffn fallback).
+    const bool has_post_attn_norm = (ly.post_attn_norm.data != nullptr && ly.ffn_norm.data != nullptr);
+    // FP32 residual accumulator (Gemma-3 dense + Gemma-4 MoE post-norm architecture).
+    // Kernel semantics: fp32_h += rmsnorm(po) * w. llama's build_norm(attn) + residual
+    // is mathematically identical for both Gemma-3 and Gemma-4 (normalize-then-add).
+    const bool using_fp32_accum = (fp32_accum_buf_ != nullptr && has_post_attn_norm);
+    if (debug_forward_enabled() && layer <= 1) {
+        QUENCH_LOG_DEBUG(
+            "[DEBUG_FWD] L%d attn: has_post_attn_norm=%d using_fp32_accum=%d "
+            "post_attn_norm=%p ffn_norm=%p",
+            layer, (int)has_post_attn_norm, (int)using_fp32_accum, ly.post_attn_norm.data, ly.ffn_norm.data);
+    }
+    const StorageTier wo_tier = (ly.wo_id != kInvalidTensorID) ? registry_.handle(ly.wo_id).primary_tier
+                                                               : StorageTier::Undefined;
+    // NVFP4 wo: primary tier OR Phase-3 secondary NVFP4 decode cache
+    // (Q8_0/Q6_K/Q5_K models). c8763ad refactor dropped the secondary check.
+    const bool wo_nvfp4_secondary = (wcache_.nvfp4.count(ly.wo.data) != 0);
+    bool will_fuse_o_nvfp4 = (!has_post_attn_norm && n == 1 && h.qtype == QType::F16 &&
+                              (wo_tier == StorageTier::NVFP4 || wo_nvfp4_secondary));
+    bool will_fuse_o_residual = (!has_post_attn_norm && !will_fuse_o_nvfp4 && n == 1 &&
+                                 qscratch_.q8_1_buf != nullptr && qscratch_.d8_buf != nullptr &&
+                                 h.qtype == QType::F16 && is_dp4a_qtype(ly.wo.qtype));
+    bool will_fuse_o_beta1 = (!has_post_attn_norm && !will_fuse_o_residual && !will_fuse_o_nvfp4 && n > 1 &&
+                              (wo_tier == StorageTier::FP16 || wo_tier == StorageTier::FP8));
+    // Dequant beta=1 path: when force_fp16_gemm bypasses FP8, dequant weights on-the-fly
+    bool will_fuse_o_dequant_beta1 = (!has_post_attn_norm && !will_fuse_o_residual && !will_fuse_o_nvfp4 &&
+                                      !will_fuse_o_beta1 && n > 1 && qscratch_.dequant != nullptr &&
+                                      dequant_gpu_supported(ly.wo.qtype));
+    if (!will_fuse_o_residual && !will_fuse_o_beta1 && !will_fuse_o_dequant_beta1 && !will_fuse_o_nvfp4 &&
+        !using_fp32_accum) {
+        QUENCH_CUDA_CHECK_LOG(cudaMemcpyAsync(r.data, h.data, h.nbytes(), cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // For Qwen3.5: Q projection writes to larger buffer (includes gate), then split
+    Tensor q_target = has_attn_output_gate ? qv_full : qv;
+
+    // GemmContext for all weight GEMM dispatches in this function.
+    auto ctx = GemmContext::make(stream, wcache_, qscratch_, runtime_config(), cur_force_fp16_,
+                                 model_->config().overrides.gemma4.force_mmvq, cur_spec_verify_);
+
+    // 3. QKV projections:  [n, d] @ W^T -> [n, proj_dim]
+    //    For decode (n=1) with matching quant types: fused RMSNorm→Q8_1→QKV GEMV.
+    //    This skips the intermediate norm_out FP16 buffer entirely.
+    //    Otherwise falls back to separate RMSNorm + 3 dp4a/cuBLAS dispatches.
+    {
+#include "exec/executor_attention_qkv.cu"
+    }
+
+    // Gemma 4: K=V sharing for global attention layers (wv == null).
+    // These layers have no V projection — V is aliased from K. Copy K→V here
+    // so all downstream code (QK-norm, V-norm, KV-write, attention) sees a
+    // valid V tensor.
+    if (prof.is_gemma4 && ly.wv.data == nullptr && kk.data != nullptr && vv.data != nullptr) {
+        size_t kv_bytes = static_cast<size_t>(n) * nkv * hd * dtype_size(kk.qtype);
+        QUENCH_CUDA_CHECK_LOG(cudaMemcpyAsync(vv.data, kk.data, kv_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+
+    // V-normalization (Gemma 4): per-head RMSNorm with NO learned weight.
+    // Matches llama.cpp's `Vcur = ggml_rms_norm(Vcur, eps)` (gemma4-iswa.cpp:82).
+    // Required for both K=V-shared global layers and standard SWA layers.
+    if (prof.is_gemma4 && v_norm_ones_buf_ != nullptr) {
+        int64_t vflat_shape[4] = {static_cast<int64_t>(n) * nkv, hd, 0, 0};
+        Tensor v_flat(vv.data, vv.qtype, 2, vflat_shape, true);
+        int64_t ones_shape[4] = {hd, 0, 0, 0};
+        Tensor ones_w(v_norm_ones_buf_, QType::F16, 1, ones_shape, true);
+        rmsnorm(v_flat, ones_w, v_flat, eps, stream, 0.0f);
+    }
+
+    if (debug_attn_steps) {
+        debug_tensor_stats("L0_step1_after_qkv_q", qv, stream);
+        debug_tensor_stats("L0_step1_after_qkv_k", kk, stream);
+    }
+
+
+    // Per-layer RoPE theta and sliding window (Gemma-3: alternating local/global layers).
+    // The window decision itself is centralized in layer_swa_window() (shared with
+    // the SWA-aware KV sizing); this block only resolves the per-layer RoPE params.
+    float layer_rope_theta = cfg.rope_theta;
+    float layer_rope_freq_scale = cfg.rope_freq_scale;
+    int layer_sliding_window = layer_swa_window(cfg, prof, layer);
+    // StreamingLLM: only meaningful when this layer also has a sliding window
+    // (otherwise full attention covers the full context anyway). Resolved
+    // again per-layer below in case Gemma-3 disables SWA on this layer.
+    int layer_n_sinks = streaming_n_sinks_;
+    if (prof.attn_variant == AttnVariant::GEMMA4_SWA) {
+        // Gemma 4: per-layer SWA pattern stored in cfg.swa_layers (1=SWA, 0=global).
+        bool is_swa = (layer < (int)cfg.swa_layers.size() && cfg.swa_layers[layer]);
+        if (is_swa) {
+            layer_rope_theta = (cfg.rope_theta_swa > 0.0f) ? cfg.rope_theta_swa : cfg.rope_local_theta;
+            layer_rope_freq_scale = 1.0f;
+        }
+        // Global layer: full attention, model rope_theta, with freq scaling.
+    } else if (prof.attn_variant == AttnVariant::GPTOSS_SWA) {
+        // gpt-oss: even layers sliding_attention (window 128), odd
+        // layers full attention. Same RoPE (YaRN) on both layer types —
+        // only the window toggles.
+    } else if (cfg.sliding_window_pattern > 0) {
+        bool is_global = (layer % cfg.sliding_window_pattern) == (cfg.sliding_window_pattern - 1);
+        if (!is_global) {
+            // Local layer: sliding window, local rope_theta, no freq scaling
+            if (cfg.rope_local_theta > 0.0f)
+                layer_rope_theta = cfg.rope_local_theta;
+            layer_rope_freq_scale = 1.0f;  // no scaling for local layers
+        }
+    }
+    // Apply caller-provided streaming window override and gate sinks on SWA-only layers.
+    if (streaming_window_ > 0)
+        layer_sliding_window = streaming_window_;
+    if (layer_sliding_window <= 0)
+        layer_n_sinks = 0;
+
+    // SWA-aware KV sizing (kv_cache.swa_sizing): windowed layers read/write
+    // the small SWA block group through the parallel table (-1 holes outside
+    // the trailing window — the kernels' window mask never reaches them).
+    // nullptr table = feature off → every layer shares state.block_tables.
+    const int* layer_block_tables =
+        (state.block_tables_swa != nullptr && layer_sliding_window > 0) ? state.block_tables_swa
+                                                                        : state.block_tables;
+
+    // Select LongRoPE frequency table based on context length (nullptr if not longrope)
+    const float* longrope_freqs = nullptr;
+    if (longrope_short_freqs_) {
+        longrope_freqs = (state.max_context_len <= longrope_orig_max_pos_) ? longrope_short_freqs_
+                                                                           : longrope_long_freqs_;
+    }
+    // Gemma 4: per-layer rope_freqs (pre-computed effective frequencies for
+    // global layers, see gguf_loader.cpp:1221). llama.cpp's gemma4-iswa.cpp:55-59
+    // passes these as freq_factors to ggml_rope_ext on full_attention layers
+    // (n_rot=hd, with most pairs effectively zeroed by 1e30 divisors). This
+    // matches the proportional-rope schema (ccss000000000000) the converter
+    // emits via partial_rotary_factor=0.25.
+    if (prof.attn_variant == AttnVariant::GEMMA4_SWA) {
+        bool layer_is_swa = (layer < (int)cfg.swa_layers.size() && cfg.swa_layers[layer]);
+        if (!layer_is_swa && ly.rope_freqs.data && ly.rope_freqs.on_device) {
+            longrope_freqs = static_cast<const float*>(ly.rope_freqs.data);
+        }
+    }
+
+    // Attention output gate (fused Q + gate projection). Two layouts exist:
+    //   (a) Per-head interleaved: [Q_h0(hd), Gate_h0(hd), Q_h1(hd), Gate_h1(hd), ...]
+    //   (b) Feature-dim concat:   [Q_all(nh*hd) | Gate_all(nh*hd)]
+    // (a) is the DEFAULT and is correct for every checkpoint tested, Qwen 3.5 and
+    // Qwen 3.6 alike. This comment used to claim (b) was "the Qwen 3.6 /
+    // Qwen3-Next layout" and that auto-detection was pending an E2E test, which
+    // sent the investigation down a dead end. Two independent checks, both
+    // in 2026-08:
+    //   - Reference: HF `modular_qwen3_next.py` splits with
+    //     `torch.chunk(q_proj(x).view(*shape, -1, head_dim * 2), 2, dim=-1)` —
+    //     grouping 2*head_dim per head and cutting inside it IS per-head
+    //     interleaved, Q first. Same as (a).
+    //   - Checkpoints: per-row NVFP4 block-scale means alternate with period
+    //     head_dim on gated models (Qwen3.6-27B ratio 1.34, 35B 1.08-1.22) and
+    //     not at all on a dense control (1.001) — the periodicity only exists
+    //     where a gate exists, i.e. Q and gate interleave per head on disk.
+    // `attention.gate_concat` stays as an escape hatch for a future checkpoint
+    // that really ships (b). It is not a knob to reach for when a hybrid looks
+    // wrong: on all three staged hybrids, flipping it is what breaks them.
+    Tensor attn_gate_buf;
+    if (has_attn_output_gate) {
+        // The gate does not own storage — it borrows the SSM z buffer, which is
+        // carved only by configure_ssm_workspace(), which in turn runs only from
+        // run_ssm()/run_gdn(). Every gated checkpoint today is also recurrent AND
+        // puts a recurrent layer before its first attention layer, so the buffer
+        // is always live by the time we get here. Neither is guaranteed by
+        // construction, and getting it wrong writes the gate through a null or
+        // stale pointer — silently, and only in prefill.
+        if (ssm_z_buf_.data == nullptr) {
+            throw std::runtime_error(
+                "attention output gate has no buffer: it borrows the SSM z buffer, which this "
+                "model never carved (no recurrent layer ran before the first attention layer). "
+                "See exec_ssm_z_cols() — the gate needs its own allocation on such a model.");
+        }
+        size_t es_q = dtype_size(compute_dtype_);
+        int64_t gate_shape[2] = {static_cast<int64_t>(n), static_cast<int64_t>(q_actual_dim)};
+        attn_gate_buf = Tensor(ssm_z_buf_.data, compute_dtype_, 2, gate_shape, true);
+
+        const bool use_concat = runtime_config().attention.gate_concat;
+        if (use_concat) {
+            // Feature-dim concat: Q = src[:, :q_actual_dim]; gate = src[:, q_actual_dim:]
+            // One 2D copy each, width = q_actual_dim bytes per row.
+            QUENCH_CUDA_CHECK_LOG(cudaMemcpy2DAsync(qv.data,
+                                                 static_cast<size_t>(q_actual_dim) * es_q,  // dst pitch
+                                                 q_target.data,
+                                                 static_cast<size_t>(q_out_dim) * es_q,  // src pitch
+                                                 static_cast<size_t>(q_actual_dim) * es_q, n,
+                                                 cudaMemcpyDeviceToDevice, stream));
+            QUENCH_CUDA_CHECK_LOG(cudaMemcpy2DAsync(attn_gate_buf.data, static_cast<size_t>(q_actual_dim) * es_q,
+                                                 static_cast<char*>(q_target.data) +
+                                                     static_cast<size_t>(q_actual_dim) * es_q,
+                                                 static_cast<size_t>(q_out_dim) * es_q,
+                                                 static_cast<size_t>(q_actual_dim) * es_q, n,
+                                                 cudaMemcpyDeviceToDevice, stream));
+        } else {
+            // Per-head interleaved: Qwen 3.5 layout.
+            // Q[t, h*hd:(h+1)*hd] = src[t, h*2*hd : h*2*hd+hd]
+            // Gate[t, h*hd:(h+1)*hd] = src[t, h*2*hd+hd : (h+1)*2*hd]
+            // Replaced nh × 2 cudaMemcpy2DAsync loop with one fused kernel
+            // (~656 D2D copies/decode-step → 1 launch on Qwen3.5 GDN W2).
+            attn_gate_split_interleaved(q_target.data, qv.data, attn_gate_buf.data, n, nh, hd, q_out_dim,
+                                        static_cast<int>(es_q), stream);
+        }
+    }
+
+    // 4+5+6. QK-norm + RoPE: fused into single kernel for decode (n=1)
+    //    For prefill or models without QK-norm, use separate kernels.
+    //    For decode with FP16 cache: fuse K-RoPE into KV write (saves 1 launch).
+    bool rope_k_deferred = false;  // true when K-RoPE will be fused into KV write
+    {
+        bool has_qk_norm = (ly.attn_q_norm.data != nullptr && ly.attn_k_norm.data != nullptr);
+        // Determine if we can fuse K-RoPE into KV cache write.
+        // YaRN models (, gpt-oss): the fused kernels
+        // (rope_q_only_fp16_kernel / write_kv_cache_rope_fused_kernel) only
+        // know theta + 1/scale — no ramp blending, no attn_factor. Prefill
+        // K would be YaRN-correct but every decode-written K plain-RoPE →
+        // degeneration from token 2. Keep YaRN on the separate full path.
+        // MLA uses asymmetric K/V head dims (hd=192, vhd=128): the fused rope-KV
+        // write kernel doesn't support different K vs V dimensions, so disable it.
+        // `rope_q_only_fp16_kernel` and the deferred K-RoPE in the KV write take
+        // a single position array and know nothing about axes. With M-RoPE
+        // active they would rotate every dimension by the text position —
+        // silently, and only wrongly for image tokens. Keep them off.
+        const bool mrope_active = state.mrope.positions != nullptr || state.mrope.pos_delta != nullptr;
+        bool can_fuse_rope_kv = (!state.is_prefill && n == 1 && qv.qtype == QType::F16 && state.kv_cache &&
+                                 state.kv_cache->qtype() == QType::F16 &&
+                                 prof.attn_variant != AttnVariant::NOPE && cfg.yarn_ext_factor <= 0.0f &&
+                                 !cfg.is_mla() && !mrope_active);
+        // Per-layer rope_dim. Gemma 4: both SWA and global layers rotate the
+        // full head_dim. Global layers' freq_factors (loaded into
+        // longrope_freqs above) zero out most pairs to realize the
+        // partial-rotary schedule from the GGUF (ccss000000000000).
+        int fused_rope_dim = cfg.rope_dim;
+        if (prof.is_gemma4) {
+            fused_rope_dim = hd;
+        } else if (fused_rope_dim > hd || fused_rope_dim <= 0) {
+            fused_rope_dim = hd;
+        }
+        const bool no_qknorm_fused = runtime_config().attention.no_qknorm_fused;
+        if (has_qk_norm && n == 1 && qv.qtype == QType::F16 && !no_qknorm_fused && prof.attn_variant != AttnVariant::NOPE) {
+            // Fused: QK-norm + RoPE in one kernel launch (decode only, n=1).
+            // Keeps norm intermediate values in FP32 shared memory.
+            qknorm_rope_fused(static_cast<half*>(qv.data), static_cast<half*>(kk.data),
+                              static_cast<const half*>(ly.attn_q_norm.data),
+                              static_cast<const half*>(ly.attn_k_norm.data), nh, nkv, hd, eps,
+                              state.positions, layer_rope_theta, layer_rope_freq_scale, fused_rope_dim,
+                              cfg.rope_neox, stream, norm_w_off_, cfg.yarn_ext_factor, cfg.yarn_attn_factor,
+                              cfg.yarn_ext_factor > 0.0f ? yarn_corr_dims_ : nullptr, longrope_freqs,
+                              state.mrope);
+        } else if (can_fuse_rope_kv && !has_qk_norm) {
+            // Fused path: Q-only RoPE here, K-RoPE deferred to KV write
+            const int effective_rope_dim = fused_rope_dim;
+            const int pairs = effective_rope_dim / 2;
+            const float inv_scaling = 1.0f / layer_rope_freq_scale;
+            rope_q_only_fp16_kernel<<<dim3(1, nh), pairs, 0, stream>>>(static_cast<half*>(qv.data),
+                                                                       state.positions, nh, hd,
+                                                                       layer_rope_theta, inv_scaling, pairs,
+                                                                       cfg.rope_neox, longrope_freqs);
+            QUENCH_CUDA_CHECK_LAUNCH();
+            rope_k_deferred = true;
+        } else {
+            // Separate path: QK-norm (if present) + RoPE on both Q and K.
+            //
+            // Some architectures (Qwen3.5-27B-mxfp4) ship `attn_q_norm` /
+            // `attn_k_norm` with a smaller dim than `head_dim` — the weight
+            // is meant to be applied per (norm_dim)-sized chunk along the
+            // head, so a 512-dim head with a 256-dim norm splits into two
+            // 256-dim sub-heads sharing the same scale. Detect that by
+            // looking at the norm weight's element count and reshape the
+            // Q/K view accordingly. When norm_dim == hd (the common case)
+            // this is a no-op.
+            auto split_norm_dim = [hd](const Tensor& w) -> int {
+                int wd = (w.data != nullptr) ? static_cast<int>(w.shape[0]) : hd;
+                return (wd > 0 && wd < hd && hd % wd == 0) ? wd : hd;
+            };
+            if (ly.attn_q_norm.data != nullptr) {
+                int q_norm_dim = split_norm_dim(ly.attn_q_norm);
+                int64_t q_flat[2] = {static_cast<int64_t>(n) * nh * (hd / q_norm_dim),
+                                     static_cast<int64_t>(q_norm_dim)};
+                Tensor q_flat_view = qv.reshape(2, q_flat);
+                rmsnorm(q_flat_view, ly.attn_q_norm, q_flat_view, eps, stream, norm_w_off_);
+            }
+            if (ly.attn_k_norm.data != nullptr) {
+                int k_norm_dim = split_norm_dim(ly.attn_k_norm);
+                int64_t k_flat[2] = {static_cast<int64_t>(n) * nkv * (hd / k_norm_dim),
+                                     static_cast<int64_t>(k_norm_dim)};
+                Tensor k_flat_view = kk.reshape(2, k_flat);
+                rmsnorm(k_flat_view, ly.attn_k_norm, k_flat_view, eps, stream, norm_w_off_);
+            }
+            int64_t q4r[4] = {1, n, nh, hd};
+            int64_t k4r[4] = {1, n, nkv, hd};
+            Tensor q4r_t = qv.reshape(4, q4r);
+            Tensor k4r_t = kk.reshape(4, k4r);
+            // Per-layer rope_dim. Gemma 4: full hd for both SWA and global;
+            // global layers' freq_factors (longrope_freqs) realize the
+            // partial-rotary schedule from the GGUF.
+            int layer_rope_dim = cfg.rope_dim;
+            if (prof.is_gemma4) {
+                layer_rope_dim = hd;
+            } else if (layer_rope_dim > hd || layer_rope_dim <= 0) {
+                layer_rope_dim = hd;  // safety clamp
+            }
+            // NoPE attention (Nemotron-H): position lives in the Mamba layers,
+            // rotating Q/K here scrambles positional binding (bag-of-words
+            // prompts). QK-norm above still applies; only the rotation is skipped.
+            if (prof.attn_variant != AttnVariant::NOPE) {
+                rope_forward(q4r_t, k4r_t, state.positions, hd, layer_rope_theta, layer_rope_freq_scale,
+                             layer_rope_dim, cfg.rope_neox, cfg.yarn_ext_factor, cfg.yarn_attn_factor,
+                             cfg.yarn_ext_factor > 0.0f ? yarn_corr_dims_ : nullptr, stream, longrope_freqs,
+                             state.mrope);
+            }
+        }
+    }
+
+    if (debug_attn_steps) {
+        debug_tensor_stats("L0_step2_after_rope_q", qv, stream);
+        debug_tensor_stats("L0_step2_after_rope_k", kk, stream);
+    }
+
+    // 7. Attention scale.
+    //   Standard archs: 1/sqrt(head_dim).
+    //   Gemma 4: 1.0 (confirmed by llama.cpp print_info: f_attn_scale = 1.0.
+    //                 Q-norm and K-norm absorb the per-element scaling).
+    //   MLA (DeepSeek-V2/V3): multiply by YaRN mscale_adj^2 where
+    //     mscale_adj = 0.1 * mscale_all_dim * ln(yarn_factor) + 1.0.
+    //   For V2-Lite (mscale_all_dim=0.707, factor=40): adj≈1.261, adj^2≈1.590.
+    float scale = (prof.is_gemma4) ? 1.0f : (1.0f / std::sqrt(static_cast<float>(hd)));
+    if (cfg.is_mla()) scale *= mla_attention_scale_multiplier(cfg);
+
+    // gpt-oss learned attention sinks: per-head logits acting as a
+    // virtual extra softmax column. Only the cuBLAS prefill softmax and the
+    // FP16 paged decode kernels understand them — prefill routing below
+    // forces the cuBLAS path whenever sinks are present.
+    const void* attn_sinks = (prof.is_gpt_oss) ? ly.attn_sinks.data : nullptr;
+
+    // MLA absorbed-decode (Phase 3, opt-in). Populate the per-layer latent cache
+    // with this step's RMSNorm'd latent + post-RoPE decoupled key for BOTH
+    // prefill and decode (so the cache is warm before the first decode step).
+    // Single-sequence only; the absorbed decode below reads this cache.
+    const bool mla_absorb_active =
+        runtime_config().attention.mla_absorb && cfg.is_mla() && mla_absorb_cache_ != nullptr &&
+        state.n_sequences == 1;
+    if (mla_absorb_active) {
+        half* cache_layer = static_cast<half*>(mla_absorb_cache_) +
+                            static_cast<size_t>(layer) * mla_absorb_layer_stride_;
+        mla_latent_cache_write(static_cast<const half*>(mla_latent_buf_),
+                               static_cast<const half*>(kk.data), cache_layer, state.positions, n, nh,
+                               hd, cfg.qk_rope_head_dim, cfg.kv_lora_rank, mla_absorb_max_seq_, stream);
+    }
+
+    if (state.is_prefill && !state.chunk_decode_attn) {
+#include "exec/executor_attention_prefill.cu"
+    } else {
+#include "exec/executor_attention_decode.cu"
+    }
+
+after_attention:
+
+    if (debug_attn_steps) {
+        debug_tensor_stats("L0_step3_after_paged_attn", ao, stream);
+        debug_tensor_stats("L0_step3_h_before_oproj", h, stream);
+    }
+
+    // MLA: V head dim (vhd) is narrower than the QK head dim (hd). The o_proj
+    // expects an [n, nh * vhd] input. The two attention paths leave ao in
+    // different layouts:
+    //   - Decode (paged kernel): writes the result COMPACTLY as [n, nh*vhd]
+    //     directly into attn_out_ (the kernel knows v_head_dim). Only a shape
+    //     fixup is needed.
+    //   - Prefill (cuBLAS/FA2/FMHA): these kernels accumulate V at hd because
+    //     the materialized V was zero-padded to hd, so ao is [n, nh, hd] with
+    //     the real values in the first vhd dims of each head and zeros in the
+    //     tail. A per-head compaction [n, nh, hd] -> [n, nh, vhd] is required;
+    //     a naive shape narrow would reinterpret an hd-strided buffer as
+    //     vhd-compact (wrong — it would take the first nh*vhd contiguous
+    //     elements, mixing head boundaries).
+    if (cfg.is_mla() && cfg.v_head_dim > 0 && cfg.v_head_dim != hd) {
+        const int vhd = cfg.v_head_dim;
+        const int64_t mla_ao_cols = static_cast<int64_t>(nh) * vhd;
+        if (state.is_prefill) {
+            // Compact hd-strided -> vhd-compact via a scratch buffer (src/dst
+            // must not alias). Prefill is not CUDA-graph-captured, so the
+            // stream-ordered alloc is amortised in the pool (same pattern as the
+            // chunked-prefill gather above).
+            void* compact_buf = nullptr;
+            const size_t bytes = static_cast<size_t>(n) * mla_ao_cols * sizeof(half);
+            QUENCH_CUDA_CHECK_LOG(cudaMallocAsync(&compact_buf, bytes, stream));
+            mla_compact_attn_output(static_cast<const half*>(ao.data),
+                                    static_cast<half*>(compact_buf), n, nh, hd, vhd, stream);
+            // Copy compacted result back into attn_out_ (dst pitch < src pitch,
+            // separate-buffer source — no in-place hazard) and narrow the view.
+            QUENCH_CUDA_CHECK_LOG(cudaMemcpyAsync(ao.data, compact_buf, bytes,
+                                               cudaMemcpyDeviceToDevice, stream));
+            QUENCH_CUDA_CHECK_LOG(cudaFreeAsync(compact_buf, stream));
+        }
+        // Both paths: narrow the view so o_proj sees nh*vhd. (Decode already
+        // wrote compact data; prefill just copied compact data into ao.)
+        if (ao.shape[1] != mla_ao_cols) {
+            ao.shape[1] = mla_ao_cols;
+            ao.compute_strides();
+        }
+    }
+
+    // Qwen3.5 attention output gate: ao[i] *= sigmoid(gate[i])
+    if (has_attn_output_gate) {
+        sigmoid_mul(ao, attn_gate_buf, ao, stream);
+    }
+
+    // 8+9. O projection + residual connection.
+    //    For decode (n=1) with dp4a: fuse residual add into GEMV, write directly
+    //    to hidden buffer. When will_fuse_o_residual is set, we skipped the
+    //    initial h→r memcpy and use h.data itself as the residual source.
+    //    This is safe because h.data is only READ (never written) between the
+    //    start of run_attention and this point.
+    if (will_fuse_o_nvfp4) {
+        // NVFP4 Wo + residual: attn_out (FP16) @ wo_nvfp4^T + residual → hidden
+        // Source: secondary cache (Q8_0/Q6_K/Q5_K) is already a populated struct;
+        // primary-tier handle needs reconstruction.
+        NvFP4QuantResult wo_nvfp4;
+        if (wo_nvfp4_secondary) {
+            wo_nvfp4 = wcache_.nvfp4.at(ly.wo.data);
+        } else {
+            const WeightHandle& wo_h = registry_.handle(ly.wo_id);
+            wo_nvfp4.packed_data = wo_h.payload.nvfp4.data;
+            wo_nvfp4.micro_scales = wo_h.payload.nvfp4.block_scales;
+            wo_nvfp4.tensor_scale = (wo_h.payload.nvfp4.tensor_scale != nullptr)
+                                        ? *wo_h.payload.nvfp4.tensor_scale
+                                        : 1.0f;
+            wo_nvfp4.N = static_cast<int>(wo_h.shape[0]);
+            wo_nvfp4.K = static_cast<int>(wo_h.shape[1]) * 2;  // packed → logical K
+        }
+        int M_o = wo_nvfp4.N;
+        int K_o = wo_nvfp4.K;
+        gemv_nvfp4_residual(wo_nvfp4, static_cast<const half*>(ao.data), static_cast<half*>(h.data),
+                            static_cast<const half*>(h.data), M_o, K_o, stream);
+    } else if (will_fuse_o_residual) {
+        int K_o = static_cast<int>(ly.wo.shape[1]);
+        int M_o = static_cast<int>(ly.wo.shape[0]);
+        // Separate quant + K-parallel GEMV: higher warp occupancy than inline_quant.
+        // quantize_fp16_to_q8_1 is a lightweight kernel (~2 us for d_model=3072).
+        // The K-parallel GEMV achieves 48 warps/SM vs inline_quant's ~8 warps/SM.
+        const half* attn_fp16 = static_cast<const half*>(ao.data);
+        const half* residual_ptr = static_cast<const half*>(h.data);
+        quantize_fp16_to_q8_1(attn_fp16, static_cast<block_q8_1*>(qscratch_.q8_1_buf), qscratch_.d8_buf, K_o,
+                              stream);
+        dispatch_gemv_residual(ly.wo.qtype, ly.wo.data, static_cast<block_q8_1*>(qscratch_.q8_1_buf),
+                               qscratch_.d8_buf, static_cast<half*>(h.data), residual_ptr, M_o, K_o, stream);
+    } else if (will_fuse_o_beta1 && !cur_force_fp16_ && wo_tier == StorageTier::FP8 &&
+               qscratch_.fp8_act != nullptr && qscratch_.d_act_scale != nullptr) {
+        // FP8 beta=1: hidden = fp8(attn_out) @ fp8(wo)^T + hidden
+        const WeightHandle& wo_h = registry_.handle(ly.wo_id);
+        int64_t wshape[2] = {wo_h.shape[0], wo_h.shape[1]};
+        Tensor fp8_wo(wo_h.payload.fp8.data, QType::FP8_E4M3, 2, wshape, true);
+        Tensor fp8_ao(qscratch_.fp8_act, QType::FP8_E4M3, ao.ndim, ao.shape, true);
+        quantize_fp16_to_fp8_e4m3(ao, fp8_ao, qscratch_.d_act_scale, stream, qscratch_.d_fp8_block_maxes,
+                                  qscratch_.d_fp8_absmax, qscratch_.fp8_max_grid);
+        gemm_cublaslt(fp8_ao, fp8_wo, h, 1.0f, 1.0f, qscratch_.d_act_scale, wo_h.payload.fp8.d_scale, stream);
+    } else if (will_fuse_o_beta1 && wo_tier == StorageTier::FP16) {
+        // Fused: hidden = attn_out @ wo^T + hidden (cuBLAS beta=1).
+        // Safe: hidden is only READ (never written) between attn_norm and here.
+        gemm_via_handle_(ly.wo_id, ao, h, ctx.with_beta(1.0f));
+    } else if ((will_fuse_o_beta1 || will_fuse_o_dequant_beta1) && qscratch_.dequant != nullptr &&
+               dequant_gpu_supported(ly.wo.qtype) &&
+               !per_layer_shapes) {  // Gemma 4: workspace stride mismatch with narrow ao
+        // Dequant beta=1: dequant weights on-the-fly, then FP16 GEMM + residual
+        gemm_via_handle_(ly.wo_id, ao, h, ctx.with_beta(1.0f));
+    } else {
+        // Fallback: separate O-projection + optional post-norm + residual add.
+        // Diagnostic: when the overrides.gemma4.fp32_gemm_out config flag (was QUENCH_GEMMA4_FP32_GEMM_OUT
+        // env) is set on Gemma-4, after the
+        // FP16 GEMM, also produce an FP32 view (fp16_to_fp32). Then route the
+        // post-attn-norm through the FP32-input variant. This keeps the proven
+        // FP16 GEMM path while letting us validate the FP32-input rmsnorm
+        // independently. Any precision win comes from the rmsnorm pre-cast
+        // happening once in __half2float vs implicit casts inside the kernel.
+        // overrides.gemma4.fp32_gemm_out config flag (was QUENCH_GEMMA4_FP32_GEMM_OUT env): keep attention
+        // output projection in FP32 to
+        // preserve cuBLAS's internal FP32 accumulator precision through the
+        // post-attention rmsnorm. Uses the cublasGemmEx FP16×FP16→FP32 path
+        // (gemm.cu mixed-precision short-circuit). Skips the FP16-only mmvq
+        // and dp4a fast paths via output.qtype==FP32 guards in dispatch.
+        const bool fp32_attn_out = (prof.is_gemma4 && using_fp32_accum &&
+                                    model_->config().overrides.gemma4.fp32_gemm_out);
+        void* po_fp32_buf = nullptr;
+        if (fp32_attn_out) {
+            size_t bytes = static_cast<size_t>(n) * model_->config().d_model * sizeof(float);
+            QUENCH_CUDA_CHECK_LOG(cudaMallocAsync(&po_fp32_buf, bytes, stream));
+            int64_t shape[2] = {static_cast<int64_t>(n), static_cast<int64_t>(model_->config().d_model)};
+            Tensor po_fp32(po_fp32_buf, QType::F32, 2, shape, true);
+            gemm_via_handle_(ly.wo_id, ao, po_fp32, ctx);
+        } else {
+            gemm_via_handle_(ly.wo_id, ao, po, ctx);
+        }
+        if (debug_attn_steps) {
+            debug_tensor_stats_all("L0_ao_pre_wo", view_tokens(ao, n), stream);
+            debug_tensor_stats_all("L0_po_after_wo", view_tokens(po, n), stream);
+            debug_tensor_rows("po_wo-0", view_tokens(po, n), stream);
+            debug_tensor_rows("ao_pre_wo-0", view_tokens(ao, n), stream);
+            // dump wo weight shape info
+            QUENCH_LOG_DEBUG("[DEBUG_FWD] wo_shape: ndim=%d shape=[%ld,%ld] qtype=%d", ly.wo.ndim,
+                          (long)ly.wo.shape[0], (long)ly.wo.shape[1], std::to_underlying(ly.wo.qtype));
+        }
+        if (has_post_attn_norm && using_fp32_accum) {
+            // Sandwich norm with FP32 accumulator (Gemma-3):
+            // FP32 residual += attn_out, then post_attn_norm → FP16 hidden.
+            Tensor fp32_h = view_tokens(fp32_hidden_, n);
+            float eps = model_->config().rms_norm_eps;
+            if (layer == 0 && debug_attn_steps) {
+                QUENCH_LOG_DEBUG("[DEBUG_FWD] L0 fp32_accum_kernel: po=%p h=%p fp32_h=%p d=%d n=%d", po.data,
+                              h.data, fp32_h.data, model_->config().d_model, n);
+            }
+            // Add attn output to FP32 accumulator, apply post_attn_norm, write FP16
+            // 256 threads: d_model_v = d_model/8 (e.g. 480 for Gemma-3 3840),
+            // so 2 iterations/thread. 512 wastes half the threads on idle lanes.
+            if (layer == 0 && debug_attn_steps) {
+                debug_tensor_stats_all("L0_pre_fp32accum_h", view_tokens(h, n), stream);
+                debug_tensor_stats_all("L0_pre_fp32accum_po", view_tokens(po, n), stream);
+                debug_tensor_rows("pre_fp32accum_po_rows", view_tokens(po, n), stream);
+                debug_tensor_rows("pre_fp32accum_h_rows", view_tokens(h, n), stream);
+                // Dump FP32 accumulator state
+                {
+                    std::vector<float> fp32_tmp(n * model_->config().d_model);
+                    cudaMemcpy(fp32_tmp.data(), fp32_h.data, fp32_tmp.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost);
+                    double fs = 0, fss = 0;
+                    for (auto v : fp32_tmp) {
+                        fs += v;
+                        fss += v * v;
+                    }
+                    QUENCH_LOG_DEBUG("[DEBUG_FWD] L0_fp32_accum_pre: sum=%.4f L2=%.4f [0..2]=%.6f %.6f %.6f", fs,
+                                  std::sqrt(fss), fp32_tmp[0], fp32_tmp[1], fp32_tmp[2]);
+                    // Last row (row n-1)
+                    int off = (n - 1) * model_->config().d_model;
+                    double rs = 0, rss = 0;
+                    for (int i = 0; i < model_->config().d_model; i++) {
+                        rs += fp32_tmp[off + i];
+                        rss += fp32_tmp[off + i] * fp32_tmp[off + i];
+                    }
+                    QUENCH_LOG_DEBUG("[DEBUG_FWD] L0_fp32_accum_pre[%d]: sum=%.4f L2=%.4f [0..2]=%.6f %.6f %.6f",
+                                  n - 1, rs, std::sqrt(rss), fp32_tmp[off], fp32_tmp[off + 1],
+                                  fp32_tmp[off + 2]);
+                }
+            }
+            if (fp32_attn_out) {
+                rmsnorm_fp32in_fp32_accum_to_fp16_kernel<<<n, 256, 0, stream>>>(
+                    static_cast<const float*>(po_fp32_buf), static_cast<const half*>(ly.post_attn_norm.data),
+                    static_cast<float*>(fp32_h.data), static_cast<half*>(h.data), model_->config().d_model,
+                    eps, norm_w_off_);
+                QUENCH_CUDA_CHECK_LAUNCH();
+            } else {
+                rmsnorm_fp32_accum_to_fp16_kernel<<<n, 256, 0, stream>>>(
+                    static_cast<const half*>(po.data), static_cast<const half*>(ly.post_attn_norm.data),
+                    static_cast<float*>(fp32_h.data), static_cast<half*>(h.data), model_->config().d_model,
+                    eps, norm_w_off_);
+                QUENCH_CUDA_CHECK_LAUNCH();
+            }
+            if (layer == 0 && debug_attn_steps) {
+                debug_tensor_stats_all("L0_post_fp32accum_h", view_tokens(h, n), stream);
+            }
+        } else if (has_post_attn_norm && prof.is_gemma4) {
+            // Gemma 4 sandwich norm: h = r + post_attn_norm(po).
+            // Normalize attention output first, THEN add residual (HF reference order).
+            rmsnorm(po, ly.post_attn_norm, po, model_->config().rms_norm_eps, stream, norm_w_off_);
+            elementwise_add_store(po, r, h, stream);
+        } else if (has_post_attn_norm) {
+            // Sandwich norm without FP32 accumulator: h = rmsnorm(po + r)
+            // Fused: 3 ops (add_store + rmsnorm + memcpy) → 1 kernel
+            add_rmsnorm_inplace(po, r, h, ly.post_attn_norm, model_->config().rms_norm_eps, stream,
+                                norm_w_off_);
+        } else {
+            // Standard pre-norm: h = attn_out + residual
+            elementwise_add_store(po, r, h, stream);
+        }
+        if (po_fp32_buf) {
+            cudaFreeAsync(po_fp32_buf, stream);
+        }
+    }
+
+    // gpt-oss o_proj bias: h holds residual + Wo·ao from whichever arm
+    // ran — broadcast-add the bias per token here, after all fused variants.
+    if (ly.o_bias.data != nullptr) {
+        Tensor hv = view_tokens(h, n);
+        add_bias(hv, ly.o_bias, stream);
+    }
+
+    // LoRA delta on o_proj: h already holds residual + Wo·ao from whichever
+    // arm ran (all fused arms require !has_post_attn_norm), so accumulating
+    // s·(ao·A^T)·B^T into h afterwards is exactly PEFT's wrapped-Linear
+    // semantics. Sandwich-norm archs (post_attn_norm) would need the delta
+    // INSIDE the norm — declined in v1 with a log.
+    if (lora_) {
+        if (const LoraWeights* w = lora_->get(layer, LoraProj::O)) {
+            if (!has_post_attn_norm) {
+                lora_delta_(*w, ao.data, h.data, n, stream);
+            } else {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    QUENCH_LOG_WARN("LoRA: o_proj adapter on a post-attn-norm arch is unsupported (v1) — "
+                                 "delta skipped");
+                }
+            }
+        }
+    }
+    if (debug_attn_steps) {
+        debug_tensor_stats("L0_step4_after_oproj_residual", h, stream);
+        debug_tensor_rows("step4_h-0", view_tokens(h, n), stream);
+        debug_tensor_stats_all("L0_step4_post_attn_all", view_tokens(h, n), stream);
+    }
+}
+
+}  // namespace quench

@@ -1,0 +1,703 @@
+# quench.conf — central runtime configuration for the quench inference engine.
+#
+# Loading precedence (first non-empty wins):
+#   1. --config <path>              CLI flag
+#   2. $QUENCH_CONFIG                  environment variable
+#   3. ./quench.conf                   working-dir relative
+#   4. ~/.config/quench/quench.conf       user config directory
+#   5. embedded defaults            (no file, all values below)
+#
+# Per-run overrides on top via:
+#   quench-cli --set kv_cache.dtype=fp8 --set runtime.cuda_graphs=never ...
+#
+# Lines starting with '#' are comments; section headers in [brackets].
+
+[runtime]
+# Force deterministic GEMM (cuBLASLt no_reduce_split). Slower but reproducible.
+deterministic_gemm   = false
+# Full reproducibility mode for temp=0 evals: deterministic MoE routing /
+# expert-scatter and top-k sampling kernels, implies deterministic_gemm.
+# Greedy output becomes bit-identical across runs/contexts (DetEvalE2ETest).
+# Guarantees + known limits (ties, top_k>128, typical_p, GDN cross-context):
+# docs/determinism.md.
+# Legacy env: QUENCH_DETERMINISTIC=1. Costs a little throughput; off by default.
+deterministic        = false
+# CUDA Graph capture: "auto" picks per-model based on architecture support;
+# "always" forces capture (fails for MoE with D2H routing); "never" disables.
+cuda_graphs          = "auto"
+# cudaStreamCaptureMode for graph capture: "relaxed" (default) |
+# "global" (strict) | "thread_local".
+graph_capture_mode   = "relaxed"
+# Capture prefill into a CUDA graph too (default ON).
+# Auto-disabled when the model's prefill path is uncapturable.
+prefill_graph        = true
+# Max concurrent sequences in a decode batch (server continuous batching).
+# 0 = auto: the engine sizes it from the model's weight footprint (a >20 GiB
+# MoE auto-picks 1). Set a positive value to force it (e.g. 4). The --max-batch
+# CLI flag and a per-request "max_batch_size" override take precedence.
+max_batch_size       = 0
+# Burst size for the autonomous decode graph loop on a NON-streaming request
+# with speculation off. The loop runs in bursts of this many tokens and returns
+# to the host to re-poll cancellation/timeout (so a disconnected client doesn't
+# burn a full generation). Output is identical to the unbounded loop; larger
+# = less relaunch overhead but higher cancel latency. Streaming + speculation
+# paths are unaffected. 0 = legacy unbounded behavior. Ignored when
+# deterministic = true (the unbounded loop stays for bit-reproducible evals).
+decode_burst         = 128
+# Cap the prefill chunk while other sequences are decoding: prefill and decode
+# share one stream, so every chunk forward inserts its full latency between two
+# decode steps of the active sessions. 1024 is the measured compromise (decoder
+# p95 inter-token 94 ms at +27% ingest TTFT); 512 for latency-critical
+# multi-tenant serving; 0 = disable (full chunk). The full chunk returns as
+# soon as nobody is decoding.
+prefill_chunk_decode_cap = 1024
+# Hybrid (SSM/GDN) decode fairness: the recurrent scan kernels are single-
+# sequence, so concurrent sessions time-slice the decode. Slice length in
+# tokens; after it the engine rotates round-robin to the next decoding
+# request. Rotation re-captures the decode graphs (~10-20 ms), which the
+# slice amortizes (~1-2% at 128). 0 = head-of-line behavior (the first
+# request runs to completion before the next produces a token).
+hybrid_decode_quantum = 128
+# Pipelined batched decode (concurrent serving, n>=2, CUDA graphs on): keep
+# one decode step in flight — step N+1 (device-side token chain + graph
+# replay) is enqueued before step N's tokens are read back, so host
+# bookkeeping and SSE delivery overlap GPU compute instead of idling it.
+# Engages for async-sampleable requests (greedy / top-k<=128 / top-p,
+# rep/freq/presence penalties included); DRY/mirostat/logit_bias/
+# constraints/logprobs requests use the per-step path. false = always
+# per-step.
+decode_pipeline      = true
+# Engine warmup at init (two tiny requests, ~2-4 s on a 30B): primes cuBLAS
+# handles + L2 AND pre-arms the decode graph pool so the FIRST real request
+# takes the same graph-kernel path as every later one — without it greedy
+# output can flip between the first and later requests on near-tie logits
+# (docs/determinism.md). ON by default; set false in dev/CI where init time
+# matters more than reproducibility.
+warmup               = true
+# Override the model's max_seq_len (0 = auto-detect). Auto-detection caps at
+# 128K (bounded further by VRAM and the model's declared context). A model that
+# declares MORE than 128K needs this set explicitly to run past 128K — the auto
+# path never selects above the 128K ceiling. Long-context TTFT grows with the
+# attention math (Qwen3-14B Q6_K measured ~3.7s at 32K, ~10s at 64K), so cap
+# it deliberately if long-transcript TTFT matters more than reach.
+max_seq_len          = 0
+# Hard VRAM budget for this process in MiB (0 = uncapped). Every sizing
+# decision (weight caches, KV clamp, expert offload, workspaces, upload
+# gates) sees a virtual GPU of this size — run multiple quench-server
+# processes on one card by giving each a slice. Best-effort cap: leave
+# ~1 GiB real headroom between the sum of budgets and the card (small
+# fixed buffers + cuBLAS internals sit outside the gates). CLI flag
+# --vram-budget overrides.
+vram_budget_mb       = 0
+# Disable Programmatic Dependent Launch (PDL). Diagnostic; small perf impact.
+no_pdl               = false
+# Naked FP16 path with FP8/NVFP4/graphs/warmup all forced off.
+debug_raw            = false
+# Disable SigLIP vision encoder CUDA-graph capture (debug).
+no_vision_graph      = false
+# Image-token budget for the Qwen3-VL encoder: the workspace is sized from it, so
+# it is a hard ceiling — a larger image is scaled down to fit, never refused.
+# 4096 patches ~ 1024x1024. Does not apply to the mmproj (SigLIP/gemma4v) path,
+# which is sized off the checkpoint's fixed image_size.
+vision_max_patches   = 4096
+
+[kv_cache]
+# KV-cache element type. "auto" (default) keeps FP16 but upgrades to FP8 E4M3 for
+# models whose author declares kv_cache_quant_algo=FP8 and whose arch family is
+# verified safe for long-context FP8 KV (Qwen3 dense/MoE, llama, nemotron_h_moe;
+# ~768 MiB saved, +~1% PPL). "auto" ALSO upgrades hint-less
+# checkpoints (i.e. every GGUF) for arch families measured PPL-neutral at 16k
+# context (Qwen3 dense + Qwen3 MoE): +41% decode at 16k on Qwen3-8B Q8_0.
+# "fp16" forces FP16. fp8|int8|int4|nvfp4|mxfp4 force that dtype.
+dtype                       = "auto"
+# Allow cuBLASLt non-deterministic algorithms with FP8 KV. Slightly faster
+# but reproducibility is lost.
+allow_nondeterministic_fp8  = false
+# Restore the legacy auto-upgrade-to-FP8 behavior (off by default).
+fp8_auto_legacy             = false
+# BitDecoding TC path for NVFP4 paged-attention QK (experimental).
+bitdecoding_qk              = false
+# BitDecoding residual FP16 cache for the newest N tokens (0 = disabled;
+# typical 4..32; only with dtype = "nvfp4" + bitdecoding_qk).
+bitdecoding_residual_tokens = 0
+# SWA-aware KV sizing: sliding-window layers (gpt-oss window=128 on every
+# other layer, gemma-3/4 5:1 pattern) allocate only the trailing window in a
+# small dedicated block group instead of full-length KV. The saving grows with
+# the max_seq_len : window ratio — modest at 16K, large at 64K-128K where the
+# fixed window is a small fraction of the context. VALIDATED on Gemma-4-26B:
+# windowed layers size to the window while the global layers keep
+# full context, so retrieval is intact — a needle placed early in a 3.2K context
+# is still retrieved (the 5 global layers carry it), output stays coherent, and
+# the full max_seq_len fits in VRAM that otherwise capped short.
+# Auto-disabled (logged) for models without SWA layers, INT8/INT4 KV, hybrids,
+# MLA, StreamingLLM, green contexts, and deterministic mode.
+# Tri-state: "auto" (default) takes the savings only when prefix caching is
+# off — one-shot quench-cli runs qualify automatically; the server (prefix_cache
+# = true) keeps warm-prefix TTFT and full-length KV. "on" forces sizing and
+# disables prefix caching (freed window blocks can't back prefix reuse —
+# snapshot-based reuse is a follow-up); use it for long single-sequence
+# contexts where KV VRAM is the bottleneck. "off" disables entirely.
+swa_sizing                  = auto
+# SWA window snapshots: device budget (MiB) for packed windowed-layer KV
+# snapshots, which make prefix caching valid UNDER swa_sizing — the snapshot
+# restores the trailing window at the reuse boundary, analogous to the
+# recurrent_snapshot_mb store for hybrids. Saved at each prefill end AND at
+# request finish (so the next agent turn reuses the whole previous
+# transcript, generated tokens included), LRU within the budget. With a
+# budget set, swa_sizing=auto no longer yields to prefix caching and the
+# server gets both: the KV savings AND warm-prefix reuse.
+# WHEN TO ENABLE (measured on gemma-3-12b): cache-hit coverage is
+# identical to full-length-KV prefix caching, and the snapshot machinery
+# itself is ~free (~0.1 ms enqueue per save/restore, <=1 ms finish sync).
+# The tradeoff is the sized attention route: ~+50-100 ms warm TTFT per turn
+# at SHORT contexts (1-2K), but FASTER prefill at long ones (+8% at 13K,
+# growing with context as windowed layers stop scaling) plus the KV VRAM
+# savings. Enable for long-context workloads (~8K+); leave off for
+# short-turn serving. 0 = off (auto yields to prefix caching, on
+# force-disables it).
+# SIZE IT PROPERLY: one snapshot is (windowed layers x window blocks) and can
+# run several hundred MiB (350 MiB on gemma-3-12b). A budget BELOW one snapshot
+# is worse than 0 — the store stays off and prefix caching is disabled with it,
+# so you lose both. The server logs the required size when this happens.
+swa_snapshot_mb             = 0
+# Pin the KV pool to exactly this many blocks instead of sizing it from the
+# VRAM budget. 0 = auto (the default). Useful when several processes share a
+# card and the pool should be a declared quantity rather than "whatever was
+# left" — and it is what makes the admission guardrail reachable: a pool too
+# small for a prompt returns HTTP 503 `capacity_error` rather than a 200 with
+# an empty completion.
+max_blocks                  = 0
+
+[rope]
+# Runtime RoPE-scaling override: stretch a model's usable context past its
+# native window without editing the checkpoint (e.g. a native-32k model to
+# 128k via YaRN). Sets the same fields the loaders set from model-declared
+# rope_scaling metadata and raises the declared context to factor × orig_ctx
+# (KV sizing / max_seq_len auto-detection see the extended window).
+# Refused for models with per-dimension RoPE tables (LongRoPE / llama3),
+# MLA, and NoPE. If the model already declares scaling, the override
+# REPLACES it (a warning is logged — set orig_ctx explicitly there).
+# "" = off (model metadata only) | "yarn" | "linear".
+scaling     = ""
+# Context-extension factor (> 1.0). Example: 4.0 → 32k becomes 128k.
+factor      = 1.0
+# Native training context the factor applies to. 0 = auto (model-declared
+# rope_n_ctx_orig, else the declared context length).
+orig_ctx    = 0
+# HF attn_factor multiplier. The kernel already applies the YaRN-paper
+# mscale 1 + 0.1*ln(factor) internally — leave at 1.0 normally.
+attn_factor = 1.0
+beta_fast   = 32.0
+beta_slow   = 1.0
+
+[vram]
+# Budget-planner tuning. Governs compute_vram_budget() only (the pre-dequant
+# phases keep their internal safety floors).
+# Share of post-reserve / post-weight-cache VRAM the KV pool targets.
+# Clamped to [0.05, 0.95]. Raise to trade weight-cache headroom for context.
+kv_fraction       = 0.8
+# Free-VRAM reserve floor as % of (budget-visible) total VRAM, still floored
+# at 256 MiB absolute. Clamped to [0, 50]. Default 10 ≈ 3.2 GiB on a 32 GiB
+# card — lower to hand more VRAM to the KV pool.
+reserve_floor_pct = 10
+# What cuBLAS/CUTLASS claim on the FIRST forward pass, in MiB. -1 = the value
+# measured on this host (3900). This is a FIXED charge: it does not shrink
+# because --vram-budget asked for a smaller slice of the card, so it floors the
+# reserve above, which is otherwise all percentages. Without that floor a
+# 16 GiB budget would scale the reserve to 1.6 GiB against a real 3.9 GiB and
+# the plan would overrun the cap by the difference. Re-measure after a
+# CUDA/driver bump.
+library_reserve_mb = -1
+# Where to remember what the first forward ACTUALLY claimed, so the SECOND start
+# on a model plans with the measured value instead of the constant above. The
+# plan needs this figure before the forward that produces it, so one run cannot
+# both measure and use it — but the value is stable per (model, quant path, CUDA
+# runtime) and invariant to batch and context, so remembering it is enough.
+# Empty = $XDG_CACHE_HOME/quench/library_reserve (or ~/.cache/quench/...); "off"
+# disables it. A miss or an unwritable path warns and charges the constant.
+#
+# IN A CONTAINER, SET THIS. The default lands in the container filesystem, so a
+# `docker run --rm` server re-measures on every start and never benefits: it
+# keeps planning with the constant. Mount a directory and point this at it.
+# Measured on Qwen3-14B-Q6_K, whose first forward actually claims 0 MiB: with
+# the path persisted the second start plans a 0 MiB reserve instead of 3900 and
+# hands the pools 639 MiB more to distribute.
+#   docker run -v $HOME/.cache/quench:/cache ... --set vram.library_reserve_cache=/cache/library_reserve
+library_reserve_cache =
+
+[attention]
+# Each "auto" key picks the kernel automatically based on weight type +
+# context length. Override only for benchmarking or compatibility tests.
+fp8_prefill          = "auto"
+# fp8-QK FMHA family: strictly opt-in ("on"). The raw e4m3 Q/K conversion
+# compounds per-layer score error on real activations — teacher-forced
+# PPL gemma-3-12b 16.6 -> 549 when it served prefill. Default "never" routes
+# hd!=128 prefill to the FP16 WMMA kernel instead.
+fp8_fmha             = "never"
+# amax-scaled e4m3 QK conversion on the fp8-QK path (only takes effect when
+# fa2_fp16qk=never or declined). Experimental quality probe; default off.
+fp8_qk_scaled        = false
+fmha_sm120           = "auto"
+# Register-resident FA2 prefill kernel for long prefill (F16, head_dim=128).
+# Default "on"; QK^T runs in f16 unless fa2_fp16qk=never AND
+# fp8_fmha=on. Declines to the FP16 WMMA kernel for unsupported configs.
+fmha_fa2             = "on"
+# FP16-QK FA2 for SHORT prefill (below fmha_prefill_threshold, hd=128):
+# replaces the materialized cuBLAS+softmax path (+25-35% pp512
+# NVFP4). "never" restores the materialized cuBLAS path.
+fa2_fp16qk           = "on"
+# f16-accumulate QK^T in the fp16-qk FA2 kernel. GeForce sm_120 runs
+# f16-src/f32-acc HMMA at 1/4 rate; f16-acc lifts the score MMA to the
+# full-rate class: +4.7-5.0% pp4096 NVFP4 prefill (Qwen3-14B / 30B-A3B). PPL
+# on a 5.8k teacher-forced corpus: 14B identical, 30B +0.10%, Q8 +0.013%.
+# Default true; set false to restore f32 accumulate.
+fa2_f16acc           = true
+# Also f16-accumulate the PV MMA (full-rate HMMA + halved O-fragment
+# registers): FA2 kernel −18% pp4096, e2e +9.7% 30B-A3B / +3.7% 14B NVFP4.
+# PPL on a 14.8k teacher-forced corpus: 14B −0.06%, 30B −0.30%, Q8 +0.002%
+# (noise). Default true. Needs fa2_f16acc.
+fa2_pv_f16acc        = true
+# HD=256 FA2 port: route head_dim=256 prefill (Qwen3.6 hybrids, gemma-class)
+# through the register-resident FA2 kernel (fp16-qk, Bq=64, TWOSLOT) instead
+# of the SMEM-tiled WMMA FMHA / cuBLAS. Default on; also lifts
+# the FP8-KV deterministic-cuBLAS forcing for hd=256 models.
+fa2_hd256            = true
+# Prefill chunk length (tokens) at/above which attention routes to FMHA
+# (tiled, O(n) memory) instead of the materialized cuBLAS S-matrix path.
+# -1 = auto (derived from the cuBLAS S-matrix VRAM cap).
+fmha_prefill_threshold = -1
+mxfp4                = "auto"
+# NVFP4-attention spike (SageAttention3 recipe), all require
+# mxfp4 = "always" (+ fa2_fp16qk = "never" so the MXFP4 FMHA actually serves
+# hd=128 prefill). QUALITY-NEGATIVE on LLMs at real context lengths
+# (Qwen3-14B-NVFP4 teacher-forced NLL +10% at 9k tokens, full recipe) —
+# diagnostic/research knobs, keep off in production.
+# blockscale: per-16-element UE4M3 scales in the mxf4nvf4.block_scale MMA
+#   (vs legacy per-row software scales, which are catastrophically lossy).
+# ksmooth: subtract per-(batch,kv_head,channel) K mean before quantization.
+# pv_fp4: P·V in NVFP4 too (two-level P scaling).
+# promote_budget: ThriftAttention-style outlier promotion (arXiv 2605.23081) —
+#   per q-tile, the top-scoring fraction of visible 64-token KV tiles (block-
+#   mean score Q̄·K̄^T, sink + diagonal force-included) computes exactly in
+#   FP32/FP16 instead of FP4. 0 = off, 1 = promote everything. Requires
+#   blockscale; head_dim 64/128 only.
+mxfp4_blockscale     = false
+mxfp4_ksmooth        = false
+mxfp4_pv_fp4         = false
+mxfp4_promote_budget = 0.0
+# KV-append-quant chunked prefill: continuation chunks read
+# K/V directly from the paged NVFP4 KV cache (quant paid once at append, no
+# gather->FP16 pass, no in-kernel quant). Requires kv_cache dtype = "nvfp4",
+# head_dim 128, single sequence. Combine with mxfp4_promote_budget.
+mxfp4_paged_kv       = false
+mxfp4_fp16_fallback  = false
+# MXFP4 → FP16 cache pruning policy: "legacy" caches FP16 for every MXFP4
+# tensor; "pruned" skips MoE expert weights + LM head (32 GiB-class loads).
+mxfp4_fp16_cache_policy = "legacy"
+force_cublas_decode  = false
+# MLA absorbed-decode latent KV cache (DeepSeek-V2/V3): decode stores only the
+# compressed latent + decoupled RoPE key and runs the mathematically-equivalent
+# absorbed attention (~9x smaller per-token KV). Prefill stays materialized;
+# single-sequence only (falls back to materialized otherwise). Opt-in.
+mla_absorb           = false
+no_qknorm_fused      = false
+splitk_pipe          = true
+# Token-tiled FP8 split-K decode attention (hd=128/bs=16 only); off = the
+# per-token pipeline kernel (A/B + rollback knob).
+fp8_tile             = true
+# GQA-batched tile variant: one block computes all Q heads of a KV head from
+# a shared smem tile (KV L2 traffic /G); off = per-head tile kernel.
+fp8_tile_gqa         = true
+gate_concat          = false
+# Max VRAM (MiB) for the materialized cuBLAS-attention S-matrix; caps how
+# long prefill stays on the fast cuBLAS path before falling back to FMHA.
+attn_scores_mib      = 384
+
+[moe]
+# Expected per-expert overhead (% of expert size) before deciding to upload
+# all experts vs. host-fall-back. 10 = aggressive auto-pick, 30 = conservative.
+expert_overhead_pct  = 10
+# Force the LAST N MoE layers off-GPU regardless of budget (debug path).
+# 0 = disabled (auto-pick).
+force_host_experts   = 0
+skip                 = false
+force_fp16_sync      = false
+no_expert_cache      = false
+# Zero MoE workspace buffers each layer (memory-safety bisect).
+zero_workspace       = false
+# Skip Gemma-4/Qwen3-Next/3.6 always-active shared MLP branch.
+no_shared_mlp        = false
+# Skip Qwen3-Next/3.6 sigmoid gate on shared expert output.
+no_shexp_gate        = false
+# Force-disable CUTLASS 3.x grouped MoE GEMM path (legacy fallback).
+no_cutlass3x         = false
+# Assert device-mirror == host LRU after every expert-cache mutation
+# (CI/regression diagnosis; costly D2H readback — never in perf runs).
+expert_cache_debug_parity = false
+# Async H2D prefetch of next layer's top-K (proj, expert) pairs under
+# host-offload (0 = off; sensible 3..16).
+prefetch_top_k       = 0
+# Allow CUDA Graphs while experts are host-offloaded (experimental;
+# correct only with 1:1 prefetch coverage).
+allow_graphs_under_offload = false
+# Per-process MoE workspace reserve override in MiB (0 = computed default).
+reserve_mib          = 0
+# CUTLASS 3.x device-args full path for NVFP4 MoE prefill (default ON,
+# +11-39% pp512).
+nvfp4_device_args    = true
+# Opt-in smallM kernel branch for NVFP4 MoE prefill + its M threshold.
+nvfp4_smallM         = false
+nvfp4_smallM_threshold = 64
+# Rows-per-block for multi-row NVFP4 MoE decode GEMV (4|8|16|32).
+mr_nr                = 8
+
+[gdn]
+# FP32 scan/output for Gated-DeltaNet (Qwen3.5/3.6). Slightly slower but
+# eliminates FP16 precision drift at long context.
+fp32_scan            = false
+fp32_out             = false
+# 0 = use the model's rms_norm_eps; otherwise override (diagnostic).
+norm_eps_override    = 0.0
+ref_kernel           = false
+vhead_reorder        = false
+# Chunkwise SSD scan (chunk-cached K/Q in smem) instead of the per-token
+# loop. Default ON (+16.7% on the GDN scan kernel).
+chunkwise_scan       = true
+# Override gated-DeltaNet weight layout (diagnostic; "" = auto).
+layout_override      = ""
+
+[gemm]
+# dp4a = INT8 4-element packed multiply-accumulate. mmvq = matrix*vec
+# quantized GEMM. Disabling forces dequant->cuBLAS path (diagnostic).
+no_dp4a_gemv         = false
+no_dp4a_lm           = false
+no_mmvq              = false
+no_mmvq_q8_0         = false
+# Extend NVFP4 decode cache to Q4_K/Q3_K/Q2_K models (default: only Q8/Q6/Q5).
+# Trades VRAM for decode throughput on sub-8-bit models.
+# Gemma-3-12B Q4_K_M: 77 → 141 tok/s (+82%).
+nvfp4_decode_all     = false
+# Q4_K HMMA tensor-core GEMM scaffold (experimental, default off).
+q4k_hmma_enabled     = false
+# NVFP4 LM-head decode cache: "auto" | "on" | "off".
+# auto = ON for native BF16/F16 heads (~+8-16% decode, +2.2% PPL, GOAL-listed
+# trade) and small dense GGUF heads (d_model <= 4096, e.g. 4B/8B: decode win
+# exceeds the PPL cost); OFF for larger/MoE GGUF heads where a
+# parity sweep measured the PPL cost above the decode win (14B, 30B-A3B).
+nvfp4_lm_head        = "auto"
+# Same for GDN/SSM-hybrid models (Qwen3.6-35B: +11.4% decode at +2.2% PPL;
+# set false for maximum coherence). Default ON.
+nvfp4_lm_head_gdn    = true
+# Batched-decode (n>1) LM head via a single CUTLASS NVFP4 GEMM instead of the
+# FP16-activation batched-M GEMV: reads the LM-head weight once per batch but
+# forces NVFP4 activations on the final logits. +8% aggregate concurrent decode
+# @16; PPL +1.9-2.1% on MoE/hybrid, +0.2-0.5% (noise-level) on dense. Default
+# ON; single-stream and spec-verify are unaffected (bit-identical).
+nvfp4_lm_head_cutlass = true
+# Quantize recipe-excluded BF16 attention q/k/v/o on native-NVFP4 hybrids
+# (Nemotron-3-Nano: +3.8% decode, PPL-neutral). Opt-in.
+nvfp4_attn_proj      = false
+# FP8 E4M3 decode sidecar (per-row scales) for the native-precision GDN/Mamba
+# in/out projections on NVFP4 hybrids: halves the dominant FP16-GEMV decode
+# bytes; prefill keeps the FP16 source. Qwen3.6-35B decode +19%, PPL flat.
+fp8_ssm_proj         = true
+# FP8 E4M3 decode sidecar for FULL-PRECISION attention projections, same
+# per-row-scale mechanism as fp8_ssm_proj, decode-only.
+# "auto" = full q/k/v/o on gpt-oss only (BF16 dense projections have no NVFP4
+# decode cache and were 33.5% of the decode window as FP16 GEMVs; measured
+# +12.1% decode, teacher-forced PPL unaffected by construction). "qo" = only
+# the q/o projections (~76% of the bytes, conservative middle mode), "on" =
+# full q/k/v/o for any full-precision attention weights, "off" disables.
+fp8_attn_proj        = "auto"
+# Route native-NVFP4 MoE expert decode (M=1) through per-expert GEMV
+# kernels instead of grouped CUTLASS (+54-80% MoE decode). Default ON.
+nvfp4_moe_decode     = true
+# FP16-accumulate cuBLAS prefill GEMMs (CUBLAS_COMPUTE_16F). GeForce sm_120
+# runs FP32-accumulate tensor cores at 1/4 rate, so 32F caps prefill at
+# ~225 TFLOPS; 16F roughly doubles GEMM throughput (Qwen3-8B Q8_0 pp512
+# +24.9% measured, PPL flat, decode neutral). auto (default) =
+# ON per arch except Gemma-3/4 (+0.7% PPL measured) and gpt-oss
+# (f16-overflow sensitivity); on = force everywhere; off = always 32F.
+# Decode (M=1) is unaffected.
+cublas_fp16_acc      = auto
+# INT8-IMMA prefill family (fused dequant on int8 tensor cores, 968 TOPS
+# measured). Validated with teacher-forced PPL gates on
+# Qwen3-8B/30B-MoE/gemma-4-26B (neutral or better) and Qwen3.6-35B (+0.55%).
+# Q8_0 dense prefill GEMMs (Qwen3-8B Q8_0 pp512 +7% over fp16-acc cuBLAS).
+q8_imma_enabled      = true
+# Grouped MoE expert prefill (one launch over all experts). The big one:
+# Qwen3-30B-A3B +151%, gemma-4-26B +111%, Qwen3.6-35B +40%.
+moe_imma_prefill     = true
+# Dense Q4_K via IMMA: stays opt-in (never validated on a clean dense Q4_K
+# model; dense Q6_K measured SLOWER than fp16-acc cuBLAS and is not wired).
+q4k_imma_prefill     = false
+
+# There is no [gemma4] section: Gemma-4 settings are per-model
+# overrides on ModelConfig::Overrides::Gemma4 (see src/model/model_config.h);
+# the GGUF loader / engine init resolver populates them when the
+# loaded model is Gemma-4. There is no user-facing knob today.
+
+[generation]
+no_logit_softcap     = false
+lm_dequant_fp16      = false
+# Force-prepend BOS token even when the tokenizer says no.
+force_bos            = false
+# Disable the banned-token list (debug).
+no_ban               = false
+# Disable RoPE inside the MTP draft head (diagnostic).
+mtp_no_rope          = false
+
+[server]
+# Prefix caching: reuse KV blocks for shared prompt prefixes (system
+# prompts, multi-turn history). Read by the engine and ORed into the live
+# config at init; PrefixCacheE2ETest guards hit==fresh equality.
+# (Library/C-API embedders that do not load quench.conf default to OFF.)
+prefix_cache         = true
+# Cap on KV blocks pinned by Anthropic cache_control / "cache_prompt"
+# requests, as percent of the KV pool. Oldest pins recycle FIFO. 0 = pin
+# requests are ignored.
+prefix_pin_budget_pct = 25
+# Serve a model other than the loaded one by swapping to it instead of
+# answering 404 — agent harnesses drive a big model beside a small one and
+# 32 GB fits one at a time. The swap is serial: in-flight generations drain
+# first (never cancelled), then the requested model is loaded; if that load
+# fails the previous model is restored. The name must resolve in the models
+# directory, so a typo is still a 404, and /v1/models lists what is
+# available. Cost: the requesting call pays one model load.
+model_swap           = true
+# How long a swap waits for in-flight generations to finish before giving
+# up and keeping the current model (503, nothing torn down).
+model_swap_drain_ms  = 60000
+# Device budget (MiB) for recurrent-state snapshots — what makes prefix
+# caching work on hybrid (SSM/GDN) models: reused KV blocks alone cannot
+# skip prefill there, the recurrent state at the skip boundary must be
+# restored too. One snapshot = one per-sequence state slab (~64 MiB on
+# Qwen3.6-35B), saved once per prefill, LRU-evicted; buffers pre-allocated
+# at engine init. quench-cli --bench pins this to 0. 0 disables snapshots and
+# with them hybrid prefix caching (dense models unaffected).
+recurrent_snapshot_mb = 256
+# Green Contexts / prefill-decode overlap streams in the server engine.
+# Opt-in (off by default): suspected memSyncDomain race on sm_120 fallback
+# streams (gemma-3-12b IMA). Set true to enable.
+green_contexts       = false
+
+[warm_cache]
+# On-disk warm weight cache: the first fully-cold model load persists its
+# converted weight buffers next to the model (".impwcache" / ".quench_warm_cache");
+# later boots restore them and skip the conversion work. Raw quant payloads are
+# never duplicated (the model file already holds them), so the cache is tiny
+# for GGUF quants / NVFP4 SafeTensors and ~model-size only for BF16-dense
+# checkpoints. Stale caches (model file changed) are ignored automatically.
+enabled              = true
+# Cache directory. Empty = default: $XDG_CACHE_HOME/quench/warm (or
+# ~/.cache/quench/warm). In containers, mount a persistent volume there (or set
+# this to one) — an ephemeral cache is rewritten on every start.
+dir                  = ""
+
+[suspend]
+# Suspend-to-RAM (POST /admin/suspend): weights are snapshotted to host RAM,
+# all VRAM is freed, and POST /admin/resume restores them in seconds.
+# device_reset additionally resets the CUDA primary context after teardown so
+# the process holds ~0 MiB VRAM (context + module code are ~300-600 MiB
+# otherwise). Set false only if a foreign library in-process holds CUDA state
+# a reset would orphan.
+device_reset         = true
+# Host RAM (MiB) the snapshot must leave free on top of its own size —
+# capture fails with a clear error instead of driving the host into swap.
+host_ram_headroom_mb = 2048
+
+[bench]
+# quench-cli --bench: also run Engine::generate() loop for accurate timing.
+generate             = false
+
+[paths]
+# Path to a vision projector .gguf file (Gemma-3, Mistral3 multimodal).
+# Qwen3-VL does not use this — its tower ships inside the checkpoint.
+mmproj               = ""
+
+[speculative]
+# n-gram (prompt-lookup) speculative decoding: drafts come from suffix
+# matches against the request's own prompt+output — no draft model. Greedy
+# verify accepts the longest matching prefix, so output stays a faithful
+# greedy decode. Batch-1, greedy sampling, non-recurrent models only
+# (SSM/GDN hybrids gate off automatically — their state cannot rewind);
+# disables the async decode graph loop while on. Wins on repetition-heavy
+# (agent/code/RAG) workloads; ~neutral on free-form prose. Default-ON.
+ngram                = true
+# Context cap for DENSE chunk-verify drafting: the captured verify
+# costs ~2.1x a decode step at 2k ctx and ~5.2x at 16k (FA2 tile over the
+# pow2 ctx tier), so dense speculation (~2 tok/verify) is net-negative past
+# ~2k. Per-step gate; MoE-NVFP4 and GDN-hybrid drafts are exempt. 0 = no cap.
+draft_ctx_cap        = 2048
+# Speculation on MoE models with native-NVFP4 experts (Qwen3-Coder-30B-FP4:
+# code-edit +49-81%, draft-poor floor -3-7%). GGUF-MoE never engages (its
+# batched verify re-dequants every activated expert per step, measured -22%)
+# and stays on the async decode loop. quench-cli --bench pins this off to keep
+# the gated tg baseline a raw-decode signal.
+moe                  = true
+# Draft tokens proposed per verify step (verify cost is ~flat in k).
+k                    = 16
+# Token-Recycling adjacency drafting (arXiv 2408.08696): engine-scoped
+# `token -> top-M successors` table fed from emitted bigrams and the
+# model's own verify-chunk top-K logits; drafts where suffix/n-gram find
+# nothing (fresh reasoning prose). recycle_depth 3 keeps the chunk in
+# capture bucket 4 = one batched-GEMV weight sweep;
+# recycle_min_streak only drafts re-confirmed successors (precision gate);
+# recycle_width > 1 verifies that many candidates per chunk (measured: the
+# accept lift does not pay for the bigger chunk — keep 1). EXPERIMENTAL,
+# default OFF: cold-start accept on fresh reasoning measures ~1.4
+# emitted/verify vs the ~1.5x verify break-even (single request; the
+# cross-request warm table is the open question).
+token_recycling      = false
+recycle_slots        = 8
+recycle_depth        = 3
+recycle_width        = 1
+recycle_min_streak   = 1
+# Suffix-indexed drafting (SuffixDecoding-style): hash-indexed suffix
+# matching instead of a per-step backward scan, continuations picked by
+# frequency vote across all occurrences, and adaptive draft length — a
+# draft backed by multiple agreeing occurrences (or a maximal-length
+# context match, e.g. the `prediction` region) extends past k up to
+# suffix_k_max. false = legacy single-most-recent scan.
+suffix               = true
+suffix_k_max         = 64
+# Shortest / longest suffix n-gram match searched. Longer min_match =
+# fewer but far more precise drafts (6 vs 3: +16% on code-edit, and the
+# number-table worst case shrinks from -13% to -2%).
+min_match            = 6
+max_match            = 12
+# Give up on speculation (and return to the fast async decode loop) after
+# this many consecutive draft misses, or when acceptance stays under 15%.
+# 0 = never give up.
+give_up_after        = 64
+# Burst-hybrid: a given-up request runs the async loop in bursts of this
+# many tokens and re-probes for drafts in between (think models reach their
+# draft-rich region only after the reasoning prose). 0 = give-up is final.
+burst                = 128
+# On a draft miss, run the async loop for this many tokens (cheap rearm,
+# no graph recapture) instead of stepping eagerly until the next draft.
+# 0 = stay eager between drafts.
+miss_burst           = 8
+# Re-arm an existing conditional decode graph on a draft miss instead of a
+# fresh capture (both share the same first-forward semantics).
+burst_rearm          = true
+# Speculation on hybrid (GDN/SSM) models: the committed recurrent-state slab
+# is snapshotted around the verify chunk; a partial acceptance restores it and
+# re-forwards the accepted prefix. quench-cli --bench pins this false.
+hybrid               = true
+# MTP-head chain-draft length (models shipping model_mtp.safetensors, e.g.
+# Qwen3.6). 0 = off. When > 0 the server loads the head (~1.6 GiB VRAM) and
+# MTP chains fill verify steps where the suffix matcher has no draft.
+# quench-cli equivalent: --mtp-spec-decode <k>.
+mtp_k                = 0
+# Serve the MTP chain's full-vocab logits GEMV from the NVFP4 LM-head decode
+# cache when one exists (~4x less HBM traffic per drafted token; the chain
+# re-reads the LM head once per draft). Draft-only precision — verification
+# stays lossless. false = keep the FP16 chain GEMV.
+mtp_nvfp4_head       = true
+# MTP economics guard: after an 8-verify sample, avg emitted tokens per
+# MTP-filled verify below this dooms MTP drafting for the request. 0 disables
+# the guard. Note: a chain of k emits at most k+1 per verify.
+mtp_econ_min_emit    = 4.0
+# Graph-captured verify: cache one CUDA graph per draft-length bucket
+# and replay it each verify step (all growing lengths are read from device
+# buffers), removing the eager launch-pacing tax. Engages only where the
+# FP16-QK FA2 kernel serves the chunk (uniform hd=128, no sinks/MLA/LongRoPE)
+# on non-hybrid models; capture failures fall back to the eager verify.
+# quench-cli --bench pins this false (raw-decode baseline semantics).
+capture              = true
+# Context capacity the captured grids and the persistent K/V scratch cover
+# (2 x cap x nkv x hd x 2B VRAM); verify steps beyond it run eager. Clamped
+# to the model's max_seq_len.
+capture_ctx_cap      = 32768
+
+[constrained]
+# Jump-ahead over schema-forced spans: when the json_schema FSM
+# forces the next characters (skeleton keys/punctuation), one speculative
+# chunk forward drafts their canonical tokenization and materializes the
+# per-position logits; subsequent tokens are sampled from those rows with
+# no forward per token. Output is exact for greedy AND sampling (each row
+# is the true logits given the accepted prefix); a diverging token just
+# re-enters normal pipelining at the cost of the one chunk forward.
+# Opt-in: on Qwen3-8B the model's context-dependent tokenization splits
+# miss the canonical draft often enough that wasted chunk forwards cost
+# more than the consumed rows save (measured -3-5%, Q8 + NVFP4).
+jump_ahead           = false
+# Minimum draft length (tokens) worth the speculative chunk; shorter
+# forced spans stay on the per-token pipeline.
+jump_min_run         = 4
+
+[ffn]
+# SwiGLU/GeGLU sparsity probe — instrumentation only, counts skippable
+# intermediate rows per threshold; no skipping (~1 µs/layer/token when on).
+sparsity_probe       = false
+# FFN down_proj row-skipping per Q8_0 block: skip blocks whose
+# |silu(gate)*up| amax is below this (0.0 = disabled = bit-identical;
+# recommended 0.005..0.05; Q8_0 decode only).
+sparsity_threshold   = 0.0
+
+[diagnostics]
+# Process log level: debug | info | warn | error | fatal.
+# "debug" is what unlocks the QUENCH_LOG_DEBUG statements throughout the engine.
+# An unrecognised value warns and keeps the current level.
+log_level            = info
+# Verbose per-layer forward dumps. Heavy I/O — use only for bisecting bugs.
+debug_forward        = false
+# Print intermediate Jinja2 chat-template rendering steps.
+debug_template       = false
+# If non-empty, dump per-layer hidden states as .npy files to this directory.
+# Special values: "1" or "all" → /tmp.
+dump_hidden_dir      = ""
+# If non-empty, dump MoE gate logits (pre-topk) and routing weights to file.
+# Special value "all" dumps every layer (default: only last + selected layers).
+dump_logits_dir      = ""
+dump_routing_dir     = ""
+# Print prefill token IDs to stderr (truncated to 20).
+dump_tokens          = false
+# Teacher-forced perplexity (--perplexity): restrict the NLL sum to logit
+# rows [ppl_first, ppl_last] (row i predicts token i+1; ppl_last=-1 = end).
+# Matches llama-perplexity's counting window (first = n_ctx/2) for the
+# cross-engine PPL-parity bar — see docs/GOAL.md release bar 1.
+ppl_first            = 0
+ppl_last             = -1
+# Stop forward pass after layer N (-1 = run full forward).
+exit_layer           = -1
+profile              = false
+graph_diag           = false
+graph_dump_dir       = ""
+# Force NVFP4 dispatch through dequant→FP16 GEMV (M=1 bisection tool).
+nvfp4_force_dequant  = false
+# Skip building the NVFP4 decode cache: decode runs on the source-precision
+# paths (dp4a GEMV / FP16 GEMV) — bisection / quality-baseline tool.
+no_nvfp4_decode_cache = false
+# graph-captured-verify feasibility probe: stream-capture every spec
+# verify chunk forward and log per-attempt outcomes (capturability census,
+# not a perf path; falls back to the eager forward on any failure).
+spec_capture_probe   = false
+# Log shape + per-candidate algo for every cuBLASLt algo selection.
+log_gemm_algo        = false
+# MTP diagnostics: per-step pattern log / pass post-RMSNorm hidden to head.
+mtp_pattern_log      = false
+mtp_prenorm_h        = false
+# Audit NVFP4 weight scales at load time.
+audit_nvfp4_scales   = false
+# VRAM accounting audit: allocation checkpoints + per-pool notes + device-used
+# peak sampler. Default off (zero overhead). See src/memory/mem_account.h.
+vram_audit           = false
+# Optional append-only file the VRAM audit table is mirrored into ("" = off).
+vram_audit_dump      = ""
+
+# ---------------------------------------------------------------------------
+# [calibration] — activation statistics for the offline quantizer
+# ---------------------------------------------------------------------------
+# Not an inference feature. With this on, every weight GEMM also accumulates
+# the mean |activation| per input channel, which quench-quantize --calib turns
+# into AWQ scales. Turning it on turns CUDA graphs off (the collector
+# allocates per-weight accumulators lazily, which a capture forbids), so a
+# server should never run with it.
+#
+# Normally set by `quench-cli --perplexity <corpus> --calibrate <out>` rather
+# than by hand.
+[calibration]
+enabled              = false
+out_path             = ""

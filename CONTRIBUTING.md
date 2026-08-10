@@ -1,0 +1,126 @@
+# Contributing to quench
+
+Thanks for taking a look. quench is a single-author / single-target experiment, so contribution overhead is intentionally low — but a few things will save us both time.
+
+## Prerequisites
+
+- An NVIDIA RTX 5090 (Blackwell, `sm_120a`). Other architectures are not supported and will not be added.
+- CUDA Toolkit 13.2 or newer (minimum enforced by CMake; the canonical, tested toolchain is 13.3 — what Docker and CI build with).
+- CMake 3.25 or newer.
+- A C++20 host compiler (GCC 12+, Clang 15+).
+- Docker with GPU passthrough if you want to use the canonical build/test workflow.
+
+The host doesn't need any of these directly — `make build` runs everything in `quench:test`, a CUDA 13.3 container with the toolchain pre-installed.
+
+## Build
+
+Inside the container or with the toolchain on the host:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+Useful build options:
+
+| Option | Default | Effect |
+|---|---|---|
+| `QUENCH_BUILD_TESTS` | `ON` | Build the GTest suite |
+| `QUENCH_BUILD_TOOLS` | `ON` | Build `quench-cli` |
+| `QUENCH_BUILD_SERVER` | `ON` | Build `quench-server` |
+| `QUENCH_SANITIZERS` | `OFF` | ASAN + UBSAN (host C++ only) |
+| `QUENCH_ALLOC_INTERPOSE` | `OFF` | Wrap `cudaMalloc`/`cudaMallocAsync` to attribute steady-state allocations — never benchmark with it on, the shim costs ~3% decode |
+| `CMAKE_BUILD_TYPE` | — | `Release` / `RelWithDebInfo` / `Debug` |
+
+## Test
+
+```bash
+make test-gpu # Full CUDA suite (~4-5 min; test-attention alone ~241s)
+make test-unit # CPU-only filter (~5s)
+make verify-fast # Build + filtered tests + graphs gate + smoke prompt
+make verify # Full pre-merge gate (~5min)
+```
+
+`make install-hooks` installs **two** hooks: pre-commit runs the full GPU suite (`make test-gpu`) when staged changes touch buildable sources, and pre-push runs `verify-fast` whenever `src/`, `include/`, `tools/`, or `tests/` change. The pre-commit one is heavy by design — skip a single commit with `git commit --no-verify`.
+
+## Benchmark
+
+For kernel work, use `quench-cli --bench` or `nsys profile --stats=true` (with `--no-cuda-graphs`, since graph replays hide individual kernel timings):
+
+```bash
+./build/quench-cli --model <model>.gguf --bench --bench-pp 512 --bench-reps 5
+nsys profile --stats=true ./build/quench-cli --model <model>.gguf \
+    --prompt "test" --max-tokens 32 --no-cuda-graphs
+```
+
+Prefill numbers vary up to 2.6× across container restarts because of cuBLAS algorithm selection. Decode is the reliable A/B signal.
+
+## Code style
+
+- C++20 host code, CUDA C++20 device code.
+- Public API in `include/quench/` is C-compatible (`extern "C"`) and treated as stable.
+- Internal types live in the `quench::` namespace.
+
+| Element | Convention |
+|---|---|
+| Classes / structs | `PascalCase` |
+| Functions / methods | `snake_case` |
+| Member variables | `trailing_underscore_` |
+| Constants | `kPascalCase` |
+| Enum values | `PascalCase` (`DType::FP16`) |
+| C API symbols | `quench_snake_case` |
+| Macros | `QUENCH_UPPER_CASE` |
+
+Other rules:
+
+- **English only.** All PRs (title + body), commit messages, code comments, docs, and `.md` files are written entirely in English. (Deliberate non-English *test data* — tokenizer Unicode fixtures, multilingual probes in `tools/analysis/degen_suite.py` — is exempt and should carry a comment saying so.)
+- `#pragma once` in headers (no include guards).
+- `.cu` for CUDA, `.cpp` for plain C++, `.h` for headers (CUDA or not).
+- File names are `snake_case`. Known intentional exception: the `smallM` fragment (`gemm_grouped_nvfp4_smallM.h`) — it mirrors a user-facing config key, which can't change without breaking configs.
+- Errors return codes (`QuenchError` / `bool`); CUDA errors are checked and logged, not thrown.
+- Don't add third-party dependencies without a very strong reason — the only runtime deps are the CUDA toolkit, CUTLASS (vendored via FetchContent), and `stb_image`.
+- **Serving allocates nothing** — the measured steady state is `0 cudaMalloc, 0 cudaMallocAsync, 0 pinned-host allocations while serving`. Acquire memory through `src/memory/backend.h` and the tier allocators (`arena`, `block_pool`, `scratch_stack`, `graph_slots`) rather than raw `cudaMalloc`/`cudaFree`, and resolve capacity at init instead of at first use. See [`docs/MEMORY_ARCHITECTURE.md`](docs/MEMORY_ARCHITECTURE.md).
+- Don't `__noinline__` GPU inner-loop functions; spills go to local memory and tank performance.
+
+## Commit messages
+
+One concern per commit. The first line is a Conventional-Commits-style summary:
+
+```
+fix(nvfp4): clamp encoder output to FP16 range
+docs: rewrite README for public release
+chore: remove dead code and personal benchmark scripts
+```
+
+Body explains *why*, not *what* — the diff already says what changed.
+
+## Pull requests
+
+- Run `make verify-fast` (or `make verify`) before pushing. CI is the source of truth, but failing local first wastes everyone's time.
+- For release-touching PRs, `scripts/check-release.sh` runs the same gate plus a doc-link / secret / personal-path scan.
+- For perf-sensitive changes, include before/after numbers in the PR description (model, quant, `tg256` and/or `pp512`, hardware).
+- Don't reintroduce SM 8.0 / 9.0 / 10.0 code paths. They were removed deliberately and the build pins `arch=compute_120a,code=sm_120a` (see `QUENCH_SM120_FLAGS` in CMakeLists.txt).
+- Don't break the C API. If a public function in `include/quench/` needs to change, update every caller and call it out in the PR.
+
+## Filing bugs
+
+Useful bug reports include:
+
+- Output of `./build/quench-cli --version` (or the commit SHA).
+- Driver version (`nvidia-smi`) and CUDA toolkit version (`nvcc --version`).
+- Model identity (file path or HF repo + quantization).
+- Exact command that reproduces.
+- Whether you ran in Docker or on the host.
+
+For decode quality regressions (degenerate output, repetition loops), `tools/analysis/degen_suite.py` is a useful first triage.
+
+## AI-agent contributions
+
+quench is built end-to-end with [Claude Code](https://claude.ai/claude-code). PRs from AI agents are welcome on the same terms as human PRs, with two extra rules:
+
+- **Read before writing.** The codebase has consistent conventions; follow them rather than inventing parallel ones.
+- **Profile, don't guess.** A "performance optimization" that regresses `tg256` is not a performance optimization. Use `nsys` and report numbers.
+
+## License
+
+By contributing, you agree your contribution is licensed under the MIT License (see `LICENSE`).

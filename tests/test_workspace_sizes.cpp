@@ -1,0 +1,519 @@
+// exec_t2_demand / exec_max_tokens — the arithmetic the T2 arena is sized from
+// (docs/MEMORY_ARCHITECTURE.md A7 step 4b).
+//
+// This is the failure class in miniature: under-reserve here and the
+// pre-dequant cache build expands into the space the arena should have held,
+// the card reaches 0.0 MiB free, and WSL2/WDDM starts spilling to host memory
+// at a 6.5x bandwidth penalty. The header has claimed since it was written that
+// this code is "pure and CUDA-free so it can be unit-tested on the CPU lane" —
+// which was true and untested. These pin the three behaviours that were each
+// discovered the expensive way.
+
+#include <gtest/gtest.h>
+
+#include "exec/workspace_sizes.h"
+
+using namespace quench;
+
+namespace {
+
+constexpr size_t kMiB = 1024ull * 1024;
+
+// A plain dense model: one weight, nothing exotic.
+ExecShape dense_shape() {
+    ExecShape s;
+    s.max_seq_len_cfg = 4096;
+    s.d_model = 4096;
+    s.d_ff = 12288;
+    s.weights = {{4096, 4096}};
+    return s;
+}
+
+}  // namespace
+
+TEST(ExecMaxTokens, ClampsToFourThousandNinetySix) {
+    ExecShape s = dense_shape();
+    EXPECT_EQ(exec_max_tokens(s, 131072), 4096);
+    EXPECT_EQ(exec_max_tokens(s, 1024), 1024);
+}
+
+TEST(ExecMaxTokens, FallsBackToTheConfigWhenNoOverrideIsGiven) {
+    ExecShape s = dense_shape();
+    s.max_seq_len_cfg = 2048;
+    EXPECT_EQ(exec_max_tokens(s, 0), 2048);
+    s.max_seq_len_cfg = 0;
+    EXPECT_EQ(exec_max_tokens(s, 0), 4096) << "a zero on both sides must not size the arena at 0";
+}
+
+// executor_workspace.cu reads has_gdn_ before it is assigned, so the
+// 2048 cap fires for SSM+MoE and never for pure GDN. This test pins the
+// AS-BUILT behaviour deliberately: "fixing" it to the intended condition would
+// reserve at T=2048 while the executor still allocates at T=4096 — a 2x
+// under-reservation, i.e. exactly the bug this file exists to prevent.
+TEST(ExecMaxTokens, ReplicatesTheAsBuiltGdnCapAndNotTheIntendedOne) {
+    ExecShape ssm_moe = dense_shape();
+    ssm_moe.is_ssm = true;
+    ssm_moe.is_moe = true;
+    EXPECT_EQ(exec_max_tokens(ssm_moe, 4096), 2048) << "SSM+MoE is the case that fires";
+
+    ExecShape gdn_only = dense_shape();
+    gdn_only.is_ssm = true;
+    gdn_only.is_moe = false;
+    EXPECT_EQ(exec_max_tokens(gdn_only, 4096), 4096)
+        << "pure GDN must NOT be capped — the executor allocates at 4096 there, and reserving "
+           "2048 would under-provision by 2x";
+}
+
+TEST(ExecMaxWeightK, TakesTheLargestLogicalK) {
+    ExecShape s = dense_shape();
+    s.weights = {{4096, 4096}, {1024, 12288}, {4096, 512}};
+    EXPECT_EQ(exec_max_weight_k(s), 12288);
+}
+
+TEST(ExecT2Demand, MmvqFollowsTheGemmScratchFormula) {
+    ExecShape s = dense_shape();
+    s.weights = {{4096, 12288}};
+    const ExecT2Demand d = exec_t2_demand(s, 1024);
+    // max_tokens * ceil(K/32) * 36 * 2
+    const size_t expect = 1024ull * ((12288 + 31) / 32) * 36 * 2;
+    EXPECT_EQ(d.mmvq_scratch, expect);
+}
+
+TEST(ExecT2Demand, EmptyShapeAsksForNothingRatherThanGuessing) {
+    ExecShape s;
+    const ExecT2Demand d = exec_t2_demand(s, 4096);
+    EXPECT_EQ(d.mmvq_scratch, 0u);
+    EXPECT_EQ(d.nvfp4_dequant, 0u);
+    EXPECT_EQ(d.total(), 0u);
+}
+
+// A dequant target above the 512 MiB cap is served by the uncapturable path, so
+// it must not raise the reservation — otherwise every large-weight model would
+// reserve half a gigabyte of arena it never takes from.
+TEST(ExecT2Demand, TargetsAboveTheCapDoNotRaiseTheReservation) {
+    ExecShape s = dense_shape();
+    // 4096 x 4096 x 2 = 32 MiB (under the cap), 32768 x 32768 x 2 = 2 GiB (over).
+    s.weights = {{4096, 4096}, {32768, 32768}};
+    s.d_ff = 0;  // isolate the tensor scan from the config-derived terms
+    const ExecT2Demand d = exec_t2_demand(s, 1024);
+    EXPECT_EQ(d.nvfp4_dequant, 32 * kMiB) << "the 2 GiB target must be ignored, not clamped to 512";
+}
+
+TEST(ExecT2Demand, PicksTheLargestTargetThatStillFitsTheCap) {
+    ExecShape s = dense_shape();
+    s.weights = {{1024, 1024}, {4096, 4096}, {2048, 2048}};
+    s.d_ff = 0;
+    const ExecT2Demand d = exec_t2_demand(s, 1024);
+    EXPECT_EQ(d.nvfp4_dequant, 32 * kMiB);
+}
+
+// The gpt-oss case: its experts arrive pre-upload as a 4D U8
+// expert_gate_up_packed_blocks slot, so a tensor scan sees nothing resembling
+// the dequant target and the reservation comes out 22.5 MiB where 31.64 is
+// needed. The real target is one expert's FUSED gate_up (2*expert_d_ff x
+// d_model), which only the config knows before the upload.
+TEST(ExecT2Demand, ConfigDerivedFusedExpertShapeIsChargedWhenTensorsCannotShowIt) {
+    ExecShape s;
+    s.max_seq_len_cfg = 4096;
+    s.d_model = 2880;
+    s.n_experts = 32;
+    // expert_d_ff MUST differ from d_ff here, or the dense `2*d_ff x d_model`
+    // term produces the same number and the assertion below passes without the
+    // expert term contributing anything. Mutation-checked: with d_ff == 2880
+    // this test survives deleting the fused-expert charge outright.
+    s.expert_d_ff = 2880;
+    s.d_ff = 512;
+    // Only a small attention weight is visible pre-upload — the experts are not.
+    s.weights = {{2880, 2880}};
+
+    const ExecT2Demand d = exec_t2_demand(s, 4096);
+    const size_t fused_gate_up = 2ull * 2880 * 2880 * 2;  // 2*expert_d_ff x d_model, fp16
+    EXPECT_EQ(d.nvfp4_dequant, fused_gate_up)
+        << "the fused gate_up must be charged from the config; a tensor scan alone under-reserves "
+           "and the workspace is then refused mid-build";
+    EXPECT_GT(d.nvfp4_dequant, 2880ull * 2880 * 2)
+        << "and it must exceed what the visible tensors alone would have asked for";
+    EXPECT_GT(d.nvfp4_dequant, 2ull * 512 * 2880 * 2)
+        << "and it must exceed the dense d_ff term, or this test is not measuring the expert path";
+}
+
+// The batched-MoE pointer arrays are charged only for a MoE model, and they scale
+// with n_experts. Small, but the point of charging them is that the arena is
+// SIZED for its tenants rather than absorbing them into slack (A7 step 4b.2).
+TEST(ExecT2Demand, MoeArraysAreChargedOnlyForMoeAndScaleWithExperts) {
+    ExecShape dense = dense_shape();
+    EXPECT_EQ(exec_t2_demand(dense, 1024).moe_arrays, 0u) << "a dense model has none of these";
+
+    ExecShape moe = dense_shape();
+    moe.n_experts = 32;
+    moe.expert_d_ff = 2880;
+    const size_t at32 = exec_t2_demand(moe, 1024).moe_arrays;
+    EXPECT_GT(at32, 0u);
+
+    moe.n_experts = 128;
+    const size_t at128 = exec_t2_demand(moe, 1024).moe_arrays;
+    EXPECT_GT(at128, at32) << "it must follow n_experts";
+    // Ten arrays of pointers/floats over 128 experts is kilobytes, not megabytes;
+    // a term that came out large would mean the arithmetic drifted from the site.
+    EXPECT_LT(at128, 64u * 1024) << "these are pointer and scale arrays, a few KiB at most";
+}
+
+// The FP8 reduction scratch is charged only when FP8 prefill is on — which on
+// sm_120 it never is ("FP8 prefill: auto -> DISABLED on sm_120"). So the RUNTIME
+// path is unreachable on the target and only this arithmetic is verifiable; the
+// test exists so the term cannot drift unnoticed against the site it mirrors.
+TEST(ExecT2Demand, Fp8ReductionIsChargedOnlyWhenFp8PrefillIsOn) {
+    ExecShape s = dense_shape();
+    s.n_heads = 32;
+    s.head_dim = 128;
+    EXPECT_EQ(exec_t2_demand(s, 1024).fp8_reduction, 0u) << "off by default, as on sm_120";
+
+    s.use_fp8_prefill = true;
+    const size_t on = exec_t2_demand(s, 1024).fp8_reduction;
+    EXPECT_GT(on, 0u);
+
+    // It follows max_tokens x max_dim / 1024, so a longer context grows it.
+    ExecShape longer = s;
+    EXPECT_GT(exec_t2_demand(longer, 4096).fp8_reduction, exec_t2_demand(longer, 512).fp8_reduction)
+        << "the reduction grid is derived from the activation size, which scales with tokens";
+
+    // A per-block absmax array over ~11M elements is tens of KiB, not MiB.
+    EXPECT_LT(exec_t2_demand(s, 4096).fp8_reduction, 1024u * 1024);
+}
+
+TEST(ExecT2Demand, ExpertDFfFallsBackToDFfWhenUnset) {
+    ExecShape a;
+    a.d_model = 2048;
+    a.d_ff = 8192;
+    a.n_experts = 8;
+    a.expert_d_ff = 0;  // unset
+    a.weights = {{2048, 2048}};
+
+    ExecShape b = a;
+    b.expert_d_ff = 8192;
+
+    EXPECT_EQ(exec_t2_demand(a, 1024).nvfp4_dequant, exec_t2_demand(b, 1024).nvfp4_dequant);
+}
+
+TEST(ExecT2Demand, TotalIsTheSumOfEveryTenant) {
+    ExecShape s = dense_shape();
+    const ExecT2Demand d = exec_t2_demand(s, 1024);
+    EXPECT_EQ(d.total(), d.mmvq_scratch + d.nvfp4_dequant + d.sample_scratch + d.moe_arrays +
+                             d.fp8_reduction + d.quant_scratch + d.splitk_scratch + d.mla_scratch +
+                             d.dry_penalty + d.cublas_workspace + d.grouped3x + d.imma_scratch);
+    EXPECT_GT(d.total(), 0u);
+}
+
+// The CUTLASS grouped staging + workspace. engine.cpp gates the prewarm on
+// profile().is_moe, so the charge has to carry the same gate — charging it for
+// every model would reserve 2 MiB a dense model can never reach, and NOT
+// charging it for a MoE model is the failure class.
+TEST(ExecT2Demand, Grouped3xIsChargedForMoeModelsOnly) {
+    ExecShape dense = dense_shape();
+    EXPECT_EQ(exec_t2_demand(dense, 1024).grouped3x, 0u);
+
+    ExecShape moe = dense_shape();
+    moe.is_moe = true;
+    moe.n_experts = 128;
+    const size_t charged = exec_t2_demand(moe, 1024).grouped3x;
+    EXPECT_GE(charged, kExecGrouped3xStagingBytes + kExecGrouped3xWorkspaceBytes);
+
+    // It follows the prewarm, which takes a fixed pair — not the expert count.
+    moe.n_experts = 256;
+    EXPECT_EQ(exec_t2_demand(moe, 1024).grouped3x, charged);
+
+    // And it is nowhere near 512 MiB: a flat reservation that size would be
+    // 3500x the measured 152 320 B requirement.
+    EXPECT_LT(charged, 8ull * 1024 * 1024);
+}
+
+// The IMMA prefill activation scratch. Two things are
+// worth pinning: it is charged only for models whose weights the IMMA routes
+// can actually take, and it takes the LARGER of the two routes rather than the
+// product of their maxima — dense runs max_tokens rows against a dense K, MoE
+// runs max_tokens * top_k rows against an expert K, and they never co-occur.
+TEST(ExecT2Demand, ImmaScratchIsZeroWithoutImmaWeightsAndTakesTheLargerRoute) {
+    ExecShape none = dense_shape();
+    EXPECT_EQ(exec_t2_demand(none, 1024).imma_scratch, 0u)
+        << "a native-NVFP4 model never enters the IMMA routes";
+
+    ExecShape densei = dense_shape();
+    densei.imma_dense_max_k = 12288;
+    const size_t dense_only = exec_t2_demand(densei, 1024).imma_scratch;
+    EXPECT_GT(dense_only, 0u);
+
+    // A small expert K with a big expansion must not be able to lower the
+    // charge below the dense route it shares the buffer with.
+    ExecShape both = densei;
+    both.is_moe = true;
+    both.imma_expert_max_k = 64;
+    both.n_experts_active = 8;
+    EXPECT_EQ(exec_t2_demand(both, 1024).imma_scratch, dense_only);
+
+    // ...and a wide expert route must raise it. 1024 rows x 8 experts x K=2048
+    // beats 1024 rows x K=12288.
+    ExecShape moe = both;
+    moe.imma_expert_max_k = 2048;
+    EXPECT_GT(exec_t2_demand(moe, 1024).imma_scratch, dense_only);
+
+    // The product of the two maxima is what this term exists NOT to charge.
+    const size_t product = static_cast<size_t>(1024) * 8 * 12288 * 2;
+    EXPECT_LT(exec_t2_demand(moe, 1024).imma_scratch, product);
+}
+
+// The cuBLASLt workspace and the algo-bench scratch (A7 step 8). Unlike every
+// other tenant these are NOT derived from the shape — cuBLASLt is handed a
+// ceiling and picks algos that fit under it — so the thing worth pinning is
+// that the charge exists for every model and does not quietly track something.
+TEST(ExecT2Demand, CublasWorkspaceIsChargedAndShapeIndependent) {
+    const ExecT2Demand dense = exec_t2_demand(dense_shape(), 1024);
+    EXPECT_GE(dense.cublas_workspace, kExecCublasWorkspaceBytes + kExecBenchScratchBytes);
+
+    ExecShape big = dense_shape();
+    big.max_seq_len_cfg = 131072;
+    big.weights = {{16384, 16384}};
+    big.max_batch_size = 32;
+    EXPECT_EQ(exec_t2_demand(big, 131072).cublas_workspace, dense.cublas_workspace);
+
+    // And it is a real part of the reservation, not a rounding term: the arena
+    // Engine::init opens must cover gemm_init()'s take or the ladder in
+    // gemm.cu steps down and cuBLASLt loses its good algos.
+    EXPECT_GT(dense.total(), kExecCublasWorkspaceBytes + kExecBenchScratchBytes);
+}
+
+// The dp4a staging family. Its max-K scan is NOT exec_max_weight_k's: the site
+// reads the raw shape[1]/shape[2] of a narrower tensor list, so ExecShape carries
+// it separately and this pins that the term follows THAT number.
+TEST(ExecT2Demand, QuantScratchFollowsTheSitesOwnMaxKAndNotTheLogicalOne) {
+    ExecShape s = dense_shape();
+    s.weights = {{4096, 32768}};  // logical K = 32768, which must NOT be used here
+    s.mmvq_max_k = 4096;
+    const size_t at_4096 = exec_t2_demand(s, 1024).quant_scratch;
+    EXPECT_GT(at_4096, 0u);
+
+    s.mmvq_max_k = 8192;
+    EXPECT_GT(exec_t2_demand(s, 1024).quant_scratch, at_4096) << "it must follow the site's max_k";
+
+    // 128 blocks x 8 rows x (48 + 4) bytes + the 4-word mask + alignment.
+    ExecShape exact = dense_shape();
+    exact.mmvq_max_k = 4096;  // 128 blocks
+    exact.max_batch_size = 1;  // rows = max(1, 8) = 8
+    const size_t expect = 128ull * 8 * (48 + sizeof(float)) + 4 * sizeof(uint32_t) + 5 * 256;
+    EXPECT_EQ(exec_t2_demand(exact, 1024).quant_scratch, expect);
+
+    // Rows follow the batch but cap at 16, so a 64-way server does not inflate a
+    // K-sized buffer 8x. The site caps it; a term that did not would over-reserve
+    // exactly where VRAM is tightest.
+    exact.max_batch_size = 64;
+    EXPECT_EQ(exec_t2_demand(exact, 1024).quant_scratch,
+              128ull * 16 * (48 + sizeof(float)) + 4 * sizeof(uint32_t) + 5 * 256);
+}
+
+// The MoE down projection quantizes top_k expert activations contiguously, so on
+// an MoE model that term can exceed max_k/32 — and did on every model the dp4a
+// MoE path serves. Sizing the buffer from max_k alone would overrun it.
+TEST(ExecT2Demand, QuantScratchTakesTheMoeDownProjectionWhenItIsLarger) {
+    ExecShape s = dense_shape();
+    s.mmvq_max_k = 2048;  // 64 blocks
+    const size_t dense_only = exec_t2_demand(s, 1024).quant_scratch;
+
+    s.n_experts = 128;
+    s.n_experts_active = 8;
+    s.mmvq_max_expert_down_k = 2048;  // 8 * 64 = 512 blocks, 8x the dense term
+    const size_t with_moe = exec_t2_demand(s, 1024).quant_scratch;
+    EXPECT_GT(with_moe, dense_only * 4)
+        << "top_k * down_k/32 must win over max_k/32 — the site takes the max of the two";
+
+    // And top_k is the multiplier, not a constant.
+    s.n_experts_active = 4;
+    EXPECT_LT(exec_t2_demand(s, 1024).quant_scratch, with_moe);
+}
+
+// The prefill pair only exists for a model with Q4_K/Q5_K dense weights (the
+// only quants the dp4a dense-prefill GEMM reads directly), and it is sized from
+// kDp4aDenseMaxM=64, NOT from max_tokens — the kernel is not taken above M=64,
+// so sizing it from the context would reserve 64x too much at ctx 4096.
+TEST(ExecT2Demand, PrefillPairIsChargedOnlyForSub5BitDenseAndCapsAtM64) {
+    ExecShape s = dense_shape();
+    s.mmvq_max_k = 4096;
+    const size_t without = exec_t2_demand(s, 4096).quant_scratch;
+
+    s.has_sub5bit_dense = true;
+    const size_t with = exec_t2_demand(s, 4096).quant_scratch;
+    EXPECT_GT(with, without);
+    // 64 * 128 blocks * 52 bytes.
+    EXPECT_EQ(with - without, 64ull * 128 * (48 + sizeof(float)));
+
+    // Capped at M=64: a longer context must not grow it.
+    EXPECT_EQ(exec_t2_demand(s, 131072).quant_scratch, with)
+        << "the dp4a dense prefill kernel is not taken above M=64, so neither is the reservation";
+    // And at max_tokens == 1 (decode-only sizing) the pair is not charged at all.
+    EXPECT_EQ(exec_t2_demand(s, 1).quant_scratch, without);
+}
+
+// MLA is DeepSeek-only, and kv_lora_rank > 0 IS the predicate (model_config.h).
+// The quartet follows max_tokens; every other model must be charged zero, or every
+// non-MLA load reserves arena for a path it cannot take.
+TEST(ExecT2Demand, MlaQuartetIsChargedOnlyForAnMlaShapeAndFollowsMaxTokens) {
+    ExecShape s = dense_shape();
+    EXPECT_EQ(exec_t2_demand(s, 1024).mla_scratch, 0u) << "a dense model has no MLA scratch";
+
+    s.n_heads = 16;
+    s.kv_lora_rank = 512;
+    s.qk_rope_head_dim = 64;
+    s.qk_nope_head_dim = 128;
+    s.v_head_dim = 128;
+    // T * 2 bytes * (kva_out + kv_lora_rank + rope + kvb_out), kva_out = 576,
+    // kvb_out = 16 * (128 + 128) = 4096.
+    const size_t expect = 1024ull * 2 * (576 + 512 + 64 + 4096) + 4 * 256;
+    EXPECT_EQ(exec_t2_demand(s, 1024).mla_scratch, expect);
+
+    // kv_b dominates through n_heads, so a wider head count must move the term.
+    ExecShape wide = s;
+    wide.n_heads = 128;
+    EXPECT_GT(exec_t2_demand(wide, 1024).mla_scratch, exec_t2_demand(s, 1024).mla_scratch * 4);
+}
+
+// The absorbed latent cache is the term that can reach a GiB, and it is sized from
+// mla_absorb_max_seq_ — the FULL sequence length, deliberately uncapped where
+// max_tokens_ clamps at 4096. Charging it from max_tokens would under-reserve 8x
+// at a 32k context, which is the failure class.
+TEST(ExecT2Demand, MlaAbsorbCacheIsOptInAndSizedFromTheFullSequenceNotMaxTokens) {
+    ExecShape s = dense_shape();
+    s.n_heads = 16;
+    s.n_layers = 27;
+    s.kv_lora_rank = 512;
+    s.qk_rope_head_dim = 64;
+    s.qk_nope_head_dim = 128;
+    s.v_head_dim = 128;
+
+    const size_t off = exec_t2_demand(s, 32768).mla_scratch;
+    s.mla_absorb = true;
+    const size_t on = exec_t2_demand(s, 32768).mla_scratch;
+
+    const size_t cache = 27ull * 32768 * 576 * 2;   // n_layers x max_seq x row_w, fp16
+    const size_t scores = 16ull * 32768 * sizeof(float);
+    EXPECT_EQ(on - off, cache + scores + 2 * 256);
+    EXPECT_GT(on - off, 900ull * 1024 * 1024)
+        << "974 MiB on a 27-layer DeepSeek at ctx 32k — the one tenant here at that scale";
+
+    // max_tokens caps at 4096, so a term sized from it would be 8x too small here.
+    EXPECT_GT(on - off, 8ull * 27 * 4096 * 576 * 2 - 1);
+
+    // And it follows the context, unlike the quartet.
+    EXPECT_LT(exec_t2_demand(s, 4096).mla_scratch, on);
+}
+
+TEST(ExecT2Demand, SplitkFollowsHeadsBatchAndContextAndCapsAt128Splits) {
+    ExecShape s = dense_shape();
+    s.n_heads = 32;
+    s.head_dim = 128;
+    s.max_batch_size = 1;  // max_logit_tokens floor of 8
+
+    // ctx 1024 -> 64 KV blocks -> 64 splits (below the cap).
+    const size_t expect = 8ull * 32 * 64 * (2 + 128) * sizeof(float) + 256;
+    EXPECT_EQ(exec_t2_demand(s, 1024).splitk_scratch, expect);
+
+    // The split count caps at 128, so beyond ctx 2048 the term stops growing.
+    const size_t at_2048 = exec_t2_demand(s, 2048).splitk_scratch;
+    EXPECT_EQ(exec_t2_demand(s, 4096).splitk_scratch, at_2048)
+        << "max_splits = min(128, ctx_blocks); reserving past the cap would be dead VRAM";
+
+    // It follows the batch, with the floor of 8 shared with the sampling scratch.
+    s.max_batch_size = 16;
+    EXPECT_EQ(exec_t2_demand(s, 1024).splitk_scratch, expect * 2 - 256);
+
+    // A shape with no attention heads asks for nothing rather than dividing by zero.
+    ExecShape headless = dense_shape();
+    EXPECT_EQ(exec_t2_demand(headless, 1024).splitk_scratch, 0u);
+}
+
+// The sampling scratch is sized from max_logit_tokens = max(max_batch, 8), which
+// is the BATCH and not the context. Mistaking it for the context misjudges
+// the tenant as ~115 MiB when it is really ~1 MiB,
+// so this pins which quantity it follows.
+TEST(ExecT2Demand, SampleScratchFollowsTheBATCHNotTheContext) {
+    constexpr size_t kSample =
+        sizeof(int32_t) + 64 * (2 * sizeof(float) + 128 * (sizeof(float) + sizeof(int32_t)));
+
+    ExecShape s = dense_shape();
+    s.max_batch_size = 1;
+    // max(1, 8) = 8 slots, two parities.
+    EXPECT_EQ(exec_t2_demand(s, 1024).sample_scratch, 2ull * 8 * kSample);
+
+    // Below the floor of 8 the size must not shrink.
+    s.max_batch_size = 4;
+    EXPECT_EQ(exec_t2_demand(s, 1024).sample_scratch, 2ull * 8 * kSample);
+
+    // Above it, it follows the batch.
+    s.max_batch_size = 16;
+    EXPECT_EQ(exec_t2_demand(s, 1024).sample_scratch, 2ull * 16 * kSample);
+
+    // And it is INDEPENDENT of the context, which is the mistake this guards.
+    ExecShape long_ctx = dense_shape();
+    long_ctx.max_batch_size = 16;
+    EXPECT_EQ(exec_t2_demand(long_ctx, 131072).sample_scratch,
+              exec_t2_demand(long_ctx, 128).sample_scratch)
+        << "sizing it from the context would ask for ~115 MiB instead of ~1 MiB";
+
+    // Sanity on the order of magnitude that made the wrong call wrong.
+    EXPECT_LT(exec_t2_demand(long_ctx, 131072).sample_scratch, 4ull * 1024 * 1024);
+}
+
+// ── exec_ssm_z_cols ──────────────────────────────────────────────────
+//
+// The Qwen3.5-style attention output gate does not own a buffer. It splits the
+// gate half out of the fused q_proj into an allocation BORROWED from the SSM z
+// buffer, which is sized from ssm_inner_size alone. Every hybrid staged today
+// makes the two exactly equal — 4096 == 4096 on Qwen3.6-35B-A3B and
+// Ornith-1.0-35B, 6144 == 6144 on Qwen3.6-27B — so the borrow fits by
+// arithmetic coincidence rather than by construction. These pin the coupling so
+// the next checkpoint with a narrower recurrent path fails a test instead of
+// overrunning the neighbouring buffer, silently and only in prefill.
+
+// A gated hybrid: recurrent layers plus full-attention layers whose q_proj is
+// twice n_heads * head_dim (Q and gate fused).
+ExecShape gated_hybrid_shape() {
+    ExecShape s;
+    s.max_seq_len_cfg = 4096;
+    s.d_model = 2048;
+    s.d_ff = 6144;
+    s.is_ssm = true;
+    s.n_heads = 16;
+    s.head_dim = 256;         // gate needs 16 * 256 = 4096 columns
+    s.ssm_inner_size = 4096;  // what every staged checkpoint happens to have
+    s.attn_gate_cols = 4096;
+    s.weights = {{4096, 2048}};
+    return s;
+}
+
+TEST(ExecSsmZCols, CoversTheAttentionGateWhenTheRecurrentInnerIsNarrower) {
+    ExecShape s = gated_hybrid_shape();
+    s.ssm_inner_size = 2048;  // a narrower recurrent path than the gate needs
+    EXPECT_EQ(exec_ssm_z_cols(s), 4096) << "the attention gate borrows this buffer and would overrun it";
+}
+
+TEST(ExecSsmZCols, KeepsTheRecurrentInnerWhenItIsTheLargerTenant) {
+    ExecShape s = gated_hybrid_shape();
+    s.ssm_inner_size = 8192;
+    EXPECT_EQ(exec_ssm_z_cols(s), 8192);
+}
+
+TEST(ExecSsmZCols, ChargesNothingExtraForAModelWithoutAGate) {
+    ExecShape s = gated_hybrid_shape();
+    s.attn_gate_cols = 0;  // no layer's q_proj is wider than n_heads * head_dim
+    EXPECT_EQ(exec_ssm_z_cols(s), s.ssm_inner_size);
+}
+
+TEST(ExecSsmZCols, MatchesTheRecurrentInnerOnEveryHybridStagedToday) {
+    // The coincidence itself, pinned: if a future change moves either sizing,
+    // this is the test that says the two were equal on purpose-by-accident.
+    ExecShape s = gated_hybrid_shape();
+    EXPECT_EQ(exec_ssm_z_cols(s), 4096);
+
+    ExecShape wide = gated_hybrid_shape();  // the 27B: 24 heads x 256
+    wide.n_heads = 24;
+    wide.attn_gate_cols = 6144;
+    wide.ssm_inner_size = 6144;
+    EXPECT_EQ(exec_ssm_z_cols(wide), 6144);
+}

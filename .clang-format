@@ -1,0 +1,73 @@
+# clang-format config for quench.
+# Style mirrors the existing codebase rather than imposing a new one — the goal
+# is "no diff on existing files when re-formatted with clang-format ≥18".
+#
+# Run: clang-format -i src/**/*.cpp src/**/*.h src/**/*.cu
+
+Language: Cpp
+BasedOnStyle: Google
+
+# --- Width / indent ---
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 110
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+
+# --- Braces ---
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+FixNamespaceComments: true
+ShortNamespaceLines: 0
+
+# --- Pointers / references ---
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+DerivePointerAlignment: false
+
+# --- Wrapping ---
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+AllowShortBlocksOnASingleLine: Empty
+BinPackArguments: true
+BinPackParameters: true
+
+# --- Includes ---
+# Existing files have varied include ordering (system / cuda / project mixed
+# intentionally for forward-decl reasons in CUDA TUs). Don't reorder.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+# --- Misc ---
+Cpp11BracedListStyle: true
+Standard: c++20
+SpaceBeforeCpp11BracedList: false
+SpacesBeforeTrailingComments: 2
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+# --- Penalties: bias against breaking strings or splitting return types ---
+PenaltyBreakAssignment: 100
+PenaltyBreakBeforeFirstCallParameter: 100
+PenaltyReturnTypeOnItsOwnLine: 1000
+
+# --- CUDA-specific: don't touch __launch_bounds__ etc. ---
+StatementMacros:
+  - QUENCH_LOG_DEBUG
+  - QUENCH_LOG_INFO
+  - QUENCH_LOG_WARN
+  - QUENCH_LOG_ERROR
+  - QUENCH_LOG_FATAL
+  - QUENCH_CUDA_CHECK
+  - QUENCH_CUDA_CHECK_LOG
+AttributeMacros:
+  - __global__
+  - __device__
+  - __host__
+  - __forceinline__
+  - __launch_bounds__

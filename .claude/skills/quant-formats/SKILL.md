@@ -1,0 +1,56 @@
+---
+name: quant-formats
+description: Use when working on quench's quantization formats, loaders, or dequant paths — GGUF Q4_0…Q8_0/Q*_K/IQ4/MXFP4, NVFP4 two-level scaling, FP8 E4M3, StorageTier, decode cache, KV-cache dtypes, "which quant should I use", scale-factor layout, dequant kernel wiring. Do NOT use for writing/optimizing GEMM/GEMV kernels (sm120-cuda-expert) or measuring quant perf (benchmark-cuda).
+---
+
+# Quantization Formats & Pipelines — quench
+
+**Sources of truth: `docs/quantization.md` (formats, choosing a quant) and `docs/quant-pipeline.md` (files, GEMM-dispatch registry, boundary rules).** This skill carries only the agent-facing gotchas — read those docs for the full picture.
+
+## The two worlds
+
+| | GGUF | SafeTensors NVFP4 (prequant) |
+|---|---|---|
+| Formats | Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q4_0, IQ4_NL/XS, MXFP4 | NVFP4: per-tensor AWQ scale (FP32) + per-16 FP8-E4M3 micro-scales |
+| Decode | dp4a GEMV per qtype; **plus NVFP4 decode cache built at init** (bandwidth win) | native NVFP4 GEMV (prmt LUT) |
+| Prefill | cuBLAS on dequanted source (full precision) | CUTLASS NVFP4 GEMM (sm_120 TC) |
+| Priority | legacy/maintenance — esp. community MXFP4 quality bugs: don't sink time | **the strategic path** |
+
+- GGUF→NVFP4 decode cache: weights converted at init; `nvfp4_beneficial` weights skip the FP16 cache. GDN/SSM projections are excluded (quality lock) and served by the `gemm.fp8_ssm_proj` decode sidecar instead (default on; covers native-F16 AND GGUF-Q8_0 sources). `gemm.nvfp4_attn_proj` stays opt-in.
+- gpt-oss: native MXFP4 experts are converted to NVFP4 at load.
+
+## StorageTier is the dispatch contract (`src/core/storage_tier.h`)
+
+`Undefined` (FATAL if dispatched) · `FP32` · `FP16` · `FP8` (E4M3 + per-tensor scale) · `NVFP4` (two-level micro-scale, decode-GEMV path) · `CUTLASS_NVFP4` (block-scaled, CUTLASS sm_120 grouped-GEMM **fast path**) · `MXFP4` (CUTLASS FMHA path).
+
+**Tier decisions have ONE source of truth**: `plan_storage()` in `src/runtime/storage_planner.h` (StoragePlan + arch rules) decides every weight's tier at load; the caches it fills are RAII-owned by the executor. Don't add ad-hoc tier overrides downstream — extend the planner's rules.
+
+**`NVFP4` ≠ `CUTLASS_NVFP4`**: a weight stuck on plain `NVFP4` falls through to the slow `gemm_nvfp4` dequant→cuBLAS fallback. For the fast path the scale factors need the CUTLASS SfAtom layout (set up in `src/exec/pre_dequant_*.cu`). `convert_scales_sfatom` is a load-time artifact — not a runtime perf lever.
+
+## MoE specifics
+
+Per-expert NVFP4 tensors are copied into one contiguous `[ne, N, K_packed]` buffer per layer/projection at load (`cache_moe_native_nvfp4`) — this is what makes CUDA-Graph capture possible. Without it: per-step FP16 dequant + cuBLAS, 5–17× slower, no graphs.
+
+## KV cache dtypes
+
+`kv_cache.dtype = fp16 | fp8 | int8 | int4 | nvfp4` (CLI: `--kv-fp8` etc.). FP8 KV has a nondeterminism opt-in (`allow_nondeterministic_fp8`). Quant-KV accuracy envelopes are frozen in tests.
+
+## Judging quantization quality (the measurement is easy to get wrong)
+
+- **Use `tools/analysis/ppl_corpus_45k.txt` (13 536 tokens), never `ppl_corpus.txt` (199 tokens).** The short corpus does not just add noise, it *inverts conclusions*: the same quench-quantize pair reads +42%/+57% on it vs +25%/+19% on the real corpus, and appears to get worse with model size when it actually gets better. Add `--set runtime.deterministic_gemm=true` to both arms.
+- **PPL alone is not enough** — it cannot see a degenerate-but-low-perplexity model. Run `tools/analysis/degen_suite.py` against a server on the quantized weights (41 checks: streaming, json_schema, tool calls, thinking). See `check-degeneration`.
+- PPL measured via `--perplexity` runs the PREFILL path, so it does NOT see decode-only sidecars (fp8_attn_proj, NVFP4 decode cache on GGUF). Judge those by greedy-identity + coherent long generations instead.
+
+## Gotchas
+
+- **Q8_0 blocks are 34 bytes, NOT 4-aligned** — `memcpy()`, never `reinterpret_cast`.
+- **FP8 prefill is disabled on sm_120** (cuBLAS `NOT_SUPPORTED` at non-aligned M) — don't build on it.
+- **MXFP4 GGUF status**: Qwen3.5-4B MXFP4 **works**; Qwen3.5-27B MXFP4 is blocked (loads OOM on 32 GB, no GGUF source).
+- **MXFP4-on-GDN-hybrids decode falls back MXFP4→FP16 — that fallback MUST be VRAM-budgeted**: unbudgeted it silently fails to allocate and produces token-0 `!` garbage. The planner reserves it at init and fails loud; don't remove the reserve.
+- **MoE expert leak fingerprint**: host-resident experts left unpromoted (raw INT8/FP4 handed to cuBLAS → `status 15` / garbage). For any MoE-expert weight bug, check `src/exec/weight_upload.cu` promotion logic FIRST.
+- **VRAM ordering**: mandatory NVFP4 caches are reserved BEFORE workspaces/KV (`cudaMemGetInfo` lies after async frees — a balloon reservation holds the floor). Don't reorder allocations "for simplicity". **A reservation alone is not enough**: sized from an *estimate* of cache demand, the caches take any shortfall back out of the reserve and the process can end at exactly 0 MiB free — where WSL2/WDDM spills into host memory and decode collapses. The shipped rule is the *build* order: the weight caches, whose demand is bounded by the model, are built first, and the KV pool — the elastic tier — takes the **measured** residual rather than a predicted one (`src/runtime/engine_kv_cache_init.cpp`). Corollary: a successful allocation at 0 MiB free proves nothing, since WDDM oversubscribes into host memory and still returns `cudaSuccess`; bandwidth is the discriminator (~1530 GB/s resident vs ~237 GB/s spilled).
+- **Dequant correctness is golden-locked**: GGUF dequant is bit-exact vs spec; f16-class cross-path tolerance is strict 1e-2 (measured ~4e-4). If your change moves these, it's a bug, not noise.
+- Quantizing new checkpoints normally happens OUTSIDE quench (NVIDIA ModelOpt / llm-compressor). Bad community quants exist — a degenerate model can be the file, not the engine (verify with llama.cpp control where possible).
+- **`quench-quantize` converts dense BF16/FP16 SafeTensors → NVFP4 in-tree, and is EXPERIMENTAL**: uncalibrated round-to-nearest, +19–25% PPL vs BF16. Use it to get a model onto the NVFP4 path for evaluation or perf work, never to produce weights anyone relies on. Dense only — 3-D MoE expert stacks are reported and left unquantized. Sharded sources need a REBUILT `model.safetensors.index.json` (one weight becomes three tensors); without it the resolver reports the misleading "No .gguf file found in directory".
+- **REFUTED, do not re-attempt: searching micro-scale candidates instead of `absmax`.** Measured 30.10 → 29.88 PPL (0.7%) for ~6× quantization cost. The micro-block is only 16 values, where absmax is already near-optimal; the dominant error is the FP4 grid itself (8 magnitudes), which no scale improves. The open lever is *moving* the error — AWQ (protect high-activation channels) or GPTQ (compensate in not-yet-quantized columns), both needing infrastructure quench lacks.
+- NVFP4 lm_head quantization (`gemm.nvfp4_lm_head`, `_gdn` default ON) trades +2.2% PPL for +8–16% decode — owner-accepted; don't "fix" the PPL delta by reverting silently.

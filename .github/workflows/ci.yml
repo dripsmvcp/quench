@@ -1,0 +1,411 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Run CI against a ref on demand: `gh workflow run CI --ref main`.
+  #
+  # Needed because a squash merge performed by AUTO-MERGE does not start a
+  # workflow run. The merge is attributed to GITHUB_TOKEN (auto-merge.yml arms
+  # it with that token), and events created by GITHUB_TOKEN do not trigger
+  # further runs — GitHub's loop prevention. A merge a human clicks does fire.
+  # So `main`'s newest CI run can be many commits old and show a state that has
+  # since been fixed. Coverage is not lost (the PR run builds the tree that gets
+  # squashed), but the branch's reported status is stale, and this makes it
+  # refreshable without a PAT or a merge queue.
+  workflow_dispatch:
+  # Nightly, 03:17 UTC.
+  #
+  # NOTE: there is currently no self-hosted GPU
+  # runner, so the `test` job below stays skipped and this schedule
+  # currently buys only reason 2. Reason 1 is kept because the job is written
+  # and the decision is reversible — if a runner is ever registered, the lane
+  # starts covering `main` on its own cadence with no further change here.
+  #
+  #  1. The GPU lane (`test`, below) is the only lane that runs the full ctest
+  #     and compute-sanitizer. It is gated on a self-hosted runner,
+  #     and a runner that only ever sees push/pull_request events tests whatever
+  #     someone happened to open a PR for — never `main` on its own schedule.
+  #  2. It refreshes `main`'s reported status, which the workflow_dispatch note
+  #     above exists to work around by hand: an auto-merge squash does not start
+  #     a run, so main's newest result can be many commits stale.
+  #
+  # Costs nothing while HAS_GPU_RUNNER is unset beyond one nightly CPU build.
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
+
+    container:
+      # Native CUDA devel image: nvcc $CUDA_VERSION is on PATH at /usr/local/cuda
+      # out of the box (matches the Dockerfile builder). No apt toolkit install.
+      # Ubuntu 26.04 → GCC 15.2, so CI compiles on the same libstdc++ 15 as the
+      # release image and catches missing-include regressions here.
+      image: nvidia/cuda:13.3.1-devel-ubuntu26.04
+
+    env:
+      # CUDA toolchain version — used by the verify step and cache keys. Kept in
+      # sync with the container image tag above (bump both to move CI).
+      CUDA_VERSION: "13.3"
+      CCACHE_DIR: /github/home/.ccache
+      CCACHE_MAXSIZE: 8G
+      CCACHE_COMPILERCHECK: content
+      CCACHE_COMPRESS: "1"
+      CCACHE_COMPRESSLEVEL: "6"
+
+    steps:
+      # Minimal git up front so checkout below pulls real history and the
+      # docs-only detection can diff against the PR/push base. (The rest of the
+      # build tooling installs later, gated on the detection result.)
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so the base SHA is present for `git diff`
+
+      # Docs-only changes (only **/*.md or docs/** touched) skip the expensive
+      # CUDA build/test below but still report the required `Build` check as
+      # success — every heavy step is gated on steps.changes.outputs.code, so the
+      # job goes green in seconds instead of pulling the multi-GB CUDA image,
+      # configuring CUTLASS and linking. Plain `git diff` (no third-party action,
+      # so no Node-deprecation churn). FAIL-OPEN: any uncertainty (no base SHA,
+      # git error, empty diff) → code=true, so detection can never wrongly skip a
+      # code change or leave the required check unreported.
+      - name: Detect non-docs changes
+        id: changes
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          code=true
+          if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            files="$(git diff --name-only "$base" HEAD)"
+            # code stays true unless EVERY changed file is markdown or under docs/.
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '(\.md$|^docs/)'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          printf 'non-docs changes: code=%s\nchanged files:\n%s\n' "$code" "${files:-<none>}"
+
+      - name: Install build deps
+        if: steps.changes.outputs.code == 'true'
+        # The native CUDA devel image already provides nvcc on PATH at
+        # /usr/local/cuda; only the non-CUDA build tooling needs installing.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ git python3 ccache
+
+      - name: Verify nvcc version
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          nvcc --version
+          nvcc --version | grep -q "release ${CUDA_VERSION}" \
+            || { echo "::error::nvcc is not CUDA ${CUDA_VERSION} (the image toolchain)"; exit 1; }
+
+      # ccache caches per-TU compile output by content hash. On a header
+      # change that invalidates many TUs (typical refactor), ccache hits
+      # on the TUs whose post-preprocessor content didn't actually change —
+      # saves the slow nvcc ptxas pass for sm_120a.
+      - name: Restore ccache
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/cache@v6
+        with:
+          path: /github/home/.ccache
+          key: ${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-ccache-
+
+      - name: Reset ccache stats
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          ccache --version
+          ccache -p | head -20 || true
+          ccache -z
+
+      # Build cache: FetchContent _deps clones + CMake config state. ccache
+      # handles object files separately. Restore-keys fall back to older
+      # caches when src changes; ninja then incrementally rebuilds and
+      # ccache provides per-TU hits even when the build cache misses.
+      - name: Cache build directory
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/cache@v6
+        with:
+          path: build
+          key: quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ hashFiles('src/**', 'include/**', 'tools/**') }}-${{ hashFiles('tests/**') }}
+          restore-keys: |
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ hashFiles('src/**', 'include/**', 'tools/**') }}-
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-
+
+      - name: Configure
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DQUENCH_BUILD_TESTS=ON \
+            -DQUENCH_BUILD_TOOLS=ON \
+            -DQUENCH_BUILD_BENCH=OFF \
+            -DQUENCH_DISABLE_120F_FALLBACK=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          # CMakeLists.txt pins arch=compute_120a,code=sm_120a directly via
+          # gencode and sets CMAKE_CUDA_ARCHITECTURES=OFF. QUENCH_DISABLE_120F_FALLBACK=ON
+          # builds the sm_120a SASS only (no compute_120f PTX fallback) — CI just
+          # verifies the build compiles + CPU tests; runtime tests need a self-hosted
+          # RTX 5090 runner. This halves device-compile time and stops every .cu
+          # diagnostic from being emitted twice (once per gencode). The shipped
+          # fatbin (release-docker) keeps the 120f PTX fallback for 5080/5070 SKUs.
+          # QUENCH_BUILD_BENCH=OFF skips ~30-60s of mxf4nvf4 microbench TUs that
+          # are bench-only — production server builds don't link them.
+
+      - name: Build
+        if: steps.changes.outputs.code == 'true'
+        run: cmake --build build -j$(nproc)
+
+      - name: ccache stats
+        if: steps.changes.outputs.code == 'true'
+        run: ccache -s
+
+      # Stage 2 (CI / CPU): run every CPU-runnable GTest. The `unit` ctest label
+      # (unit_core, unit_text, the CPU subset of test-e2e, guard_e2e_lane_split)
+      # needs no GPU and no model — it is the half of the suite that CAN run here.
+      # GPU correctness lives in the local pre-commit hook (Stage 1), since this
+      # CUDA build container has no device. Before this step CI built the CPU
+      # tests but never ran them (only mock-api + the usually-absent self-hosted
+      # GPU job did), so e.g. the tool-call and Bearer-auth unit tests were dark.
+      - name: Run CPU unit tests (ctest -L unit)
+        if: steps.changes.outputs.code == 'true'
+        run: cd build && ctest -L unit --output-on-failure --timeout 120
+
+      # clang-tidy moved OUT of this job into the separate non-required `tidy` job
+      # below. It was ~22 min of this ~26 min job and — being advisory
+      # (continue-on-error) — only delayed the merge-gating `Build` check without
+      # ever failing it. The `tidy` job reuses this job's cached build/ for
+      # compile_commands.json + _deps, lints only the PR's changed .cpp, and never
+      # blocks merge.
+
+      - name: Upload build artifacts
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: quench-build
+          path: |
+            build/quench-cli
+            build/quench-tests
+            build/test-core
+            build/test-text
+            build/test-compute
+            build/test-attention
+            build/test-quant
+            build/test-kv
+            build/test-moe-gdn
+            build/test-e2e
+            build/libimp.a
+
+  # clang-tidy (advisory, NON-REQUIRED) — split out of the Build job so it never
+  # delays the merge-gating `Build` check (it was ~22 min of that job). Reuses the
+  # Build job's cached build/ (compile_commands.json + FetchContent _deps such as
+  # CUTLASS) via the same cache key, so no second CUDA configure is needed. Lints
+  # only the .cpp CHANGED in the PR — a normal PR is seconds; a big refactor is
+  # bounded to its own files. Still .cpp-only (clang-tidy can't parse .cu without
+  # the full nvcc flagset). Kernel (.cu) correctness is covered by the GPU tests +
+  # compute-sanitizer (see the `test` job).
+  tidy:
+    name: clang-tidy
+    needs: build
+    if: needs.build.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:13.3.1-devel-ubuntu26.04
+    env:
+      CUDA_VERSION: "13.3"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # base SHA must be present for the changed-files diff
+      - name: Install deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake g++ git python3 clang-tidy
+      - name: Restore build dir (compile_commands.json + _deps)
+        uses: actions/cache@v6
+        with:
+          path: build
+          key: quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ hashFiles('src/**', 'include/**', 'tools/**') }}-${{ hashFiles('tests/**') }}
+          restore-keys: |
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ hashFiles('src/**', 'include/**', 'tools/**') }}-
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-
+            quench-build-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-
+      - name: clang-tidy (changed .cpp only, advisory)
+        continue-on-error: true  # advisory — flip to a hard gate once baseline-clean
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          mapfile -t changed < <(git diff --name-only "$base" HEAD | grep -E '^(src|tools)/.*\.cpp$' || true)
+          if [ ${#changed[@]} -eq 0 ]; then echo "no src/tools .cpp changed — nothing to lint"; exit 0; fi
+          # compile_commands.json comes from the cached build/. If the cache missed
+          # (cold key), reconfigure — _deps in the restored build/ keeps it cheap;
+          # a fully cold _deps fetch is the rare worst case.
+          if [ ! -f build/compile_commands.json ]; then
+            echo "::warning::no cached compile_commands.json — reconfiguring"
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DQUENCH_BUILD_TESTS=ON \
+              -DQUENCH_BUILD_TOOLS=ON -DQUENCH_BUILD_BENCH=OFF -DQUENCH_DISABLE_120F_FALLBACK=ON \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
+          fi
+          echo "linting ${#changed[@]} changed .cpp:"; printf '  %s\n' "${changed[@]}"
+          # Drop the per-TU progress + cumulative count lines (CUTLASS/CUDA headers
+          # inflate the count into the hundreds of thousands); .clang-tidy's
+          # HeaderFilterRegex already restricts displayed diagnostics to our code.
+          clang-tidy -p build --warnings-as-errors= "${changed[@]}" 2>&1 \
+            | grep -vE '^\[[0-9]+/[0-9]+\] Processing file|^[0-9]+ warnings generated\.$' || true
+
+  # CPU-only API contract check (R3 / P2.6). The Python mock suite in tests/api/
+  # exercises the HTTP schema, SSE envelope, error bodies and lifecycle against
+  # the in-process mock_server.py — no GPU, no model, no CUDA toolchain. It was
+  # the cheapest CI-able coverage in the test audit but ran only manually
+  # (run_mock_tests.sh). Separate ubuntu job so it stays independent of the slow
+  # CUDA Build job; "not perf and not tools" deselects the real-model markers.
+  # NOTE: do NOT rename the `build` job's `name: Build` — a branch ruleset
+  # requires that exact check name.
+  mock-api:
+    name: Mock API contract
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/api/requirements.txt
+
+      - name: Run mock API suite
+        env:
+          QUENCH_USE_MOCK: "1"
+        run: python -m pytest tests/api -m "not perf and not tools" --tb=short -q
+
+  # Format check (CI1). clang-format on CHANGED LINES only (git clang-format).
+  # ADVISORY: it surfaces the diff but does not fail the job — the repo is not
+  # clang-format-clean, so a rename or edit that merely TOUCHES a wrap-sensitive
+  # line gets re-wrapped by clang-format and would red-X otherwise (whole CUDA
+  # files are never reformatted, see CLAUDE.md). Flip back to a hard `exit 1`
+  # after a repo-wide format normalization. clang-tidy (the Build job) is advisory
+  # for the same reason.
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install clang-format
+        # ubuntu-24.04 is a non-container host runner — apt and /usr/local/bin
+        # need sudo (the CUDA Build job runs in a container as root, so it doesn't).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format git curl ca-certificates
+          if ! command -v git-clang-format >/dev/null; then
+            sudo curl -fsSL https://raw.githubusercontent.com/llvm/llvm-project/release/18.x/clang/tools/clang-format/git-clang-format \
+              -o /usr/local/bin/git-clang-format && sudo chmod +x /usr/local/bin/git-clang-format
+          fi
+      - name: clang-format (changed lines)
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          echo "diff base: $base"
+          diff="$(git clang-format --style=file --diff "$base" 2>/dev/null || true)"
+          if [ -z "$diff" ] || echo "$diff" | grep -qiE 'did not modify|no modified files'; then
+            echo "format clean on changed lines"; exit 0
+          fi
+          echo "$diff"
+          echo "::warning::clang-format would change the above changed lines — run 'make format' (advisory, not blocking)"
+          exit 0
+
+  # Publishable-tree hygiene: the cheap half of scripts/check-release.sh (doc
+  # links, maintainer paths, credential-shaped strings, tracked binaries,
+  # LICENSE). SKIP_VERIFY=1 drops the `make verify-fast` step — that one needs a
+  # GPU and the built image, so it stays local. Own ubuntu job, no toolchain,
+  # seconds. The script existed since the first release but was wired into
+  # nothing, so it only ran when someone remembered it: v0.20.0 found two
+  # maintainer paths that had been on main for days. A gate nobody runs is not
+  # a gate.
+  hygiene:
+    name: Release hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: check-release.sh (without the GPU gate)
+        env:
+          SKIP_VERIFY: "1"
+        run: bash scripts/check-release.sh
+
+  test:
+    name: Test
+    needs: build
+    # GPU tests need a self-hosted runner with NVIDIA GPU. To turn this lane on:
+    #
+    #   1. On the GPU box: Settings → Actions → Runners → New self-hosted runner,
+    #      and give it the labels  self-hosted, gpu, cuda  (all three; the
+    #      runs-on below requires the full set).
+    #   2. Settings → Secrets and variables → Actions → Variables → new variable
+    #      HAS_GPU_RUNNER = true.
+    # This is the only lane that runs the full ctest and compute-sanitizer —
+    # everything else in CI is CPU-only. Until step 2, the job is
+    # skipped rather than failing. Until then,
+    # this job is skipped — same effective behavior as the prior `if: false`,
+    # but flips automatically when a runner appears. Also skipped on docs-only
+    # changes (build uploads no artifact then — nothing to download/test).
+    if: ${{ vars.HAS_GPU_RUNNER == 'true' && needs.build.outputs.code == 'true' }}
+    runs-on: [self-hosted, gpu, cuda]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          name: quench-build
+          path: build/
+
+      - name: Run tests
+        run: |
+          chmod +x build/quench-tests || true
+          chmod +x build/test-* 2>/dev/null || true
+          cd build && ctest --output-on-failure --timeout 120
+
+      # compute-sanitizer (memcheck) — the real "linter" for CUDA kernels: catches
+      # out-of-bounds, misaligned and use-after-free device accesses that clang-tidy
+      # fundamentally cannot see (it parses no .cu). Advisory for now (continue-on-
+      # error); scoped to the kernel-heavy binaries to bound the ~10-30x slowdown.
+      # Mirrors the local `make sanitize` target. Flip to a hard gate once clean.
+      - name: compute-sanitizer (memcheck, advisory)
+        continue-on-error: true
+        run: |
+          SAN="$(command -v compute-sanitizer || echo /usr/local/cuda/bin/compute-sanitizer)"
+          # Fast kernel binaries only — memcheck is ~10-30x, so the slow FA2 sweeps
+          # in test-attention are deliberately excluded to keep this advisory step
+          # bounded (run it there on demand via `make sanitize`).
+          for b in test-kv test-moe-gdn test-quant; do
+            echo "== compute-sanitizer memcheck: $b =="
+            chmod +x "build/$b" 2>/dev/null || true
+            "$SAN" --tool memcheck --error-exitcode 1 --leak-check no "build/$b" \
+              || { echo "::warning::compute-sanitizer flagged $b"; }
+          done

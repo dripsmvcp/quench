@@ -1,0 +1,1408 @@
+#include "model/weight_map.h"
+#include "vision/qwen3vl_vision_load.h"
+#include "model/tensor_kind_matcher.h"
+#include "core/logging.h"
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cstdlib>
+
+namespace quench {
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Split a string by delimiter into tokens.
+static std::vector<std::string> split(const std::string& s, char delim) {
+    std::vector<std::string> tokens;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == delim) {
+            if (i > start) {
+                tokens.push_back(s.substr(start, i - start));
+            }
+            start = i + 1;
+        }
+    }
+    return tokens;
+}
+
+// Try to parse a non-negative integer from a string. Returns -1 on failure.
+static int parse_int(const std::string& s) {
+    if (s.empty())
+        return -1;
+    for (char c : s) {
+        if (c < '0' || c > '9')
+            return -1;
+    }
+    return std::atoi(s.c_str());
+}
+
+// Ensure model.layers_ has at least (idx + 1) elements.
+static void ensure_layer(Model& model, int idx) {
+    if (idx >= static_cast<int>(model.layers_.size())) {
+        model.layers_.resize(idx + 1);
+    }
+}
+
+// Ensure expert vectors within a layer have at least (idx + 1) elements.
+static void ensure_expert(TransformerLayer& layer, int idx) {
+    int needed = idx + 1;
+    if (static_cast<int>(layer.expert_w_gate.size()) < needed)
+        layer.expert_w_gate.resize(needed);
+    if (static_cast<int>(layer.expert_w_up.size()) < needed)
+        layer.expert_w_up.resize(needed);
+    if (static_cast<int>(layer.expert_w_down.size()) < needed)
+        layer.expert_w_down.resize(needed);
+}
+
+// Helper: write one of weight_scale / weight_scale_2 / input_scale into
+// model.nvfp4_scratch_[key], depending on `kind`. Used by every NVFP4-
+// prequant scale-routing branch in apply_weights().
+static void route_nvfp4_scale(Model& model, const std::string& key, const std::string& kind,
+                              const Tensor& t) {
+    auto& sc = model.nvfp4_scratch_[key];
+    if (kind == "weight_scale")
+        sc.weight_scale = t;
+    else if (kind == "weight_scale_2")
+        sc.weight_scale_2 = t;
+    else if (kind == "input_scale")
+        sc.input_scale = t;
+}
+
+// ---------------------------------------------------------------------------
+// WeightMap
+// ---------------------------------------------------------------------------
+
+WeightMap::WeightMap(ModelArch arch) : arch_(arch) {
+    // name_map_ is used by map_name() for quick lookups of non-layer weights.
+    // Layer weights are handled by pattern matching in apply_weights().
+
+    // All supported architectures share the same top-level embedding names
+    // (HuggingFace convention).
+    name_map_["model.embed_tokens.weight"] = "tok_emb";
+    name_map_["model.norm.weight"] = "out_norm";
+    name_map_["lm_head.weight"] = "out_proj";
+}
+
+std::string WeightMap::map_name(const std::string& name) const {
+    // Check static map first.
+    auto it = name_map_.find(name);
+    if (it != name_map_.end()) {
+        return it->second;
+    }
+
+    // Pattern-match layer weights to produce a human-readable internal name.
+    auto parts = split(name, '.');
+    // Expected: model . layers . {i} . <rest>
+    if (parts.size() >= 4 && parts[0] == "model" && parts[1] == "layers") {
+        int layer = parse_int(parts[2]);
+        if (layer < 0)
+            return name;
+
+        std::string prefix = "layer." + parts[2] + ".";
+
+        // Attention weights: self_attn.{q,k,v,o}_proj.weight
+        // Also MLA (DeepSeek-V2/V3): kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj
+        if (parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "weight") {
+            if (parts[4] == "q_proj")
+                return prefix + "wq";
+            if (parts[4] == "k_proj")
+                return prefix + "wk";
+            if (parts[4] == "v_proj")
+                return prefix + "wv";
+            if (parts[4] == "o_proj")
+                return prefix + "wo";
+            if (parts[4] == "kv_a_proj_with_mqa")
+                return prefix + "kv_a_proj";
+            if (parts[4] == "kv_a_layernorm")
+                return prefix + "kv_a_norm";
+            if (parts[4] == "kv_b_proj")
+                return prefix + "kv_b_proj";
+        }
+
+        // Attention norm
+        if (parts.size() >= 5 && parts[3] == "input_layernorm" && parts[4] == "weight") {
+            return prefix + "attn_norm";
+        }
+
+        // FFN norm
+        if (parts.size() >= 5 && parts[3] == "post_attention_layernorm" && parts[4] == "weight") {
+            return prefix + "ffn_norm";
+        }
+
+        // Dense MLP: mlp.{gate_proj,up_proj,down_proj}.weight
+        if (parts.size() >= 6 && parts[3] == "mlp" && parts[5] == "weight") {
+            if (parts[4] == "gate_proj")
+                return prefix + "w_gate";
+            if (parts[4] == "up_proj")
+                return prefix + "w_up";
+            if (parts[4] == "down_proj")
+                return prefix + "w_down";
+        }
+
+        // Mixtral MoE: block_sparse_moe.gate.weight
+        if (parts.size() >= 6 && parts[3] == "block_sparse_moe" && parts[4] == "gate" &&
+            parts[5] == "weight") {
+            return prefix + "moe_gate";
+        }
+
+        // Mixtral MoE experts: block_sparse_moe.experts.{e}.w{1,2,3}.weight
+        if (parts.size() >= 8 && parts[3] == "block_sparse_moe" && parts[4] == "experts" &&
+            parts[7] == "weight") {
+            int expert = parse_int(parts[5]);
+            if (expert >= 0) {
+                std::string ep = prefix + "expert." + parts[5] + ".";
+                if (parts[6] == "w1")
+                    return ep + "w_gate";
+                if (parts[6] == "w3")
+                    return ep + "w_up";
+                if (parts[6] == "w2")
+                    return ep + "w_down";
+            }
+        }
+
+        // DeepSeek MoE router: mlp.gate.weight / mlp.gate.bias
+        if (parts.size() >= 6 && parts[3] == "mlp" && parts[4] == "gate") {
+            if (parts[5] == "weight")
+                return prefix + "moe_gate";
+            if (parts[5] == "bias")
+                return prefix + "moe_router_bias";
+        }
+
+        // DeepSeek MoE experts: mlp.experts.{e}.{gate_proj,up_proj,down_proj}.weight
+        if (parts.size() >= 8 && parts[3] == "mlp" && parts[4] == "experts" && parts[7] == "weight") {
+            int expert = parse_int(parts[5]);
+            if (expert >= 0) {
+                std::string ep = prefix + "expert." + parts[5] + ".";
+                if (parts[6] == "gate_proj")
+                    return ep + "w_gate";
+                if (parts[6] == "up_proj")
+                    return ep + "w_up";
+                if (parts[6] == "down_proj")
+                    return ep + "w_down";
+            }
+        }
+
+        // Shared expert: mlp.shared_expert[s].{gate,up,down}_proj.weight
+        // DeepSeek-V2/V3 uses plural "shared_experts"; Qwen3/Nemotron use
+        // singular "shared_expert" after Nemotron name-translation. Accept both.
+        if (parts.size() >= 7 && parts[3] == "mlp" &&
+            (parts[4] == "shared_expert" || parts[4] == "shared_experts") &&
+            parts[6] == "weight") {
+            if (parts[5] == "gate_proj")
+                return prefix + "w_gate_shared";
+            if (parts[5] == "up_proj")
+                return prefix + "w_up_shared";
+            if (parts[5] == "down_proj")
+                return prefix + "w_down_shared";
+        }
+
+        // Attention biases: self_attn.{q,k,v,o}_proj.bias
+        if (parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "bias") {
+            if (parts[4] == "q_proj")
+                return prefix + "q_bias";
+            if (parts[4] == "k_proj")
+                return prefix + "k_bias";
+            if (parts[4] == "v_proj")
+                return prefix + "v_bias";
+            if (parts[4] == "o_proj")
+                return prefix + "o_bias";
+        }
+
+        // gpt-oss attention sinks: self_attn.sinks [n_heads]
+        if (parts.size() >= 5 && parts[3] == "self_attn" && parts[4] == "sinks") {
+            return prefix + "attn_sinks";
+        }
+
+        // gpt-oss MoE router: mlp.router.{weight,bias}
+        if (parts.size() >= 6 && parts[3] == "mlp" && parts[4] == "router") {
+            if (parts[5] == "weight")
+                return prefix + "moe_gate";
+            if (parts[5] == "bias")
+                return prefix + "moe_router_bias";
+        }
+
+        // gpt-oss pre-packed MXFP4 experts:
+        //   mlp.experts.{gate_up,down}_proj_{blocks,scales,bias}
+        if (parts.size() >= 6 && parts[3] == "mlp" && parts[4] == "experts") {
+            return prefix + "experts." + parts[5];
+        }
+
+        // QK-Norm: self_attn.{q,k}_norm.weight
+        if (parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "weight") {
+            if (parts[4] == "q_norm")
+                return prefix + "attn_q_norm";
+            if (parts[4] == "k_norm")
+                return prefix + "attn_k_norm";
+        }
+
+        // Post-layer norms (Gemma-3)
+        if (parts.size() >= 5 && parts[4] == "weight") {
+            if (parts[3] == "post_feedforward_layernorm")
+                return prefix + "post_ffn_norm";
+            if (parts[3] == "pre_feedforward_layernorm")
+                return prefix + "ffn_norm";
+        }
+
+        // Mixtral MoE router bias: block_sparse_moe.gate.bias
+        if (parts.size() >= 6 && parts[3] == "block_sparse_moe" && parts[4] == "gate" && parts[5] == "bias") {
+            return prefix + "moe_router_bias";
+        }
+
+        // GPTQ weights: self_attn.{q,k,v,o}_proj.{qweight,qzeros,scales,g_idx}
+        if (parts.size() >= 6 && parts[3] == "self_attn") {
+            const std::string& field = parts[5];
+            if (field == "qweight" || field == "qzeros" || field == "scales" || field == "g_idx") {
+                return prefix + parts[4] + "." + field;
+            }
+        }
+        // GPTQ weights: mlp.{gate,up,down}_proj.{qweight,qzeros,scales,g_idx}
+        if (parts.size() >= 6 && parts[3] == "mlp") {
+            const std::string& field = parts[5];
+            if (field == "qweight" || field == "qzeros" || field == "scales" || field == "g_idx") {
+                return prefix + parts[4] + "." + field;
+            }
+        }
+
+        // GDN (Gated DeltaNet / Qwen3.5): temporal_block.{gate_proj,alpha,beta}.weight
+        if (parts.size() >= 6 && parts[3] == "temporal_block" && parts[5] == "weight") {
+            if (parts[4] == "gate_proj")
+                return prefix + "gdn_gate";
+            if (parts[4] == "alpha")
+                return prefix + "gdn_alpha";
+            if (parts[4] == "beta")
+                return prefix + "gdn_beta";
+        }
+
+        // SSM (Mamba2 / Nemotron-H)
+        if (parts[3] == "mamba") {
+            if (parts.size() >= 6 && parts[5] == "weight") {
+                if (parts[4] == "in_proj")
+                    return prefix + "ssm_in";
+                if (parts[4] == "out_proj")
+                    return prefix + "ssm_out";
+                if (parts[4] == "conv1d")
+                    return prefix + "ssm_conv1d_w";
+                if (parts[4] == "norm")
+                    return prefix + "ssm_norm_w";
+            }
+            if (parts.size() >= 6 && parts[4] == "conv1d" && parts[5] == "bias")
+                return prefix + "ssm_conv1d_b";
+            if (parts.size() >= 5 && parts[4] == "dt_bias")
+                return prefix + "ssm_dt_b";
+            if (parts.size() >= 5 && parts[4] == "A_log")
+                return prefix + "ssm_a";
+            if (parts.size() >= 5 && parts[4] == "D")
+                return prefix + "ssm_d";
+        }
+    }
+
+    return name;
+}
+
+// Assign one GPTQ sub-tensor (qweight/qzeros/scales/g_idx) by field name.
+// Returns true if `field` named a known slot. Shared by the self_attn and mlp
+// GPTQ branches in apply_weights() (same field set, only the proj→slot mapping
+// differs).
+static bool assign_gptq_field(TransformerLayer::GPTQWeight* gptq, const std::string& field,
+                              const Tensor& t) {
+    if (!gptq)
+        return false;
+    if (field == "qweight")
+        gptq->qweight = t;
+    else if (field == "qzeros")
+        gptq->qzeros = t;
+    else if (field == "scales")
+        gptq->scales = t;
+    else if (field == "g_idx")
+        gptq->g_idx = t;
+    else
+        return false;
+    return true;
+}
+
+bool WeightMap::apply_weights(Model& model, const std::unordered_map<std::string, Tensor>& tensors) {
+    if (tensors.empty()) {
+        QUENCH_LOG_ERROR("WeightMap: no tensors to apply");
+        return false;
+    }
+
+    int assigned = 0;
+    int skipped = 0;
+
+    const bool is_gemma4 = (arch_ == ModelArch::GEMMA4);
+    const bool is_gemma4_moe = is_gemma4 && (model.config_.n_experts > 0);
+    const bool is_qwen36_moe = (arch_ == ModelArch::QWEN36_MOE);
+    const bool is_nemotron_h = (arch_ == ModelArch::NEMOTRON_H_MOE);
+    // Multimodal "ForConditionalGeneration" wrappers (Gemma-4-VL, Qwen3.5-VL,
+    // Qwen3.6-VL) share the same `model.language_model.*` / `model.vision_tower.*`
+    // (resp. `model.visual.*`) layout plus an `mtp.*` head. Text-only variants
+    // ship bare `model.*` keys, so the strip is prefix-guarded and a no-op there.
+    const bool needs_multimodal_strip = is_gemma4 || is_qwen36_moe || (arch_ == ModelArch::QWEN35) ||
+                                        model.config_.multimodal_wrapper;
+
+    for (auto& [orig_name, tensor] : tensors) {
+        std::string name = orig_name;
+        if (needs_multimodal_strip) {
+            const std::string vt_prefix = "model.vision_tower.";
+            if (name.compare(0, vt_prefix.size(), vt_prefix) == 0) {
+                ++skipped;  // silently skip vision encoder weights
+                continue;
+            }
+            // Qwen3.6-VL also ships a separate visual tower under
+            // `model.visual.*` and a multi-token-prediction head under
+            // `mtp.*`. Both arrive in distinct shards we never load, but if
+            // they ever appear in the main shard, drop them here.
+            const std::string visual_prefix = "model.visual.";
+            if (name.compare(0, visual_prefix.size(), visual_prefix) == 0) {
+                // Routed into the vision tower below when there is one; still
+                // skipped here either way, since these are not LM weights.
+                ++skipped;
+                continue;
+            }
+            // Gemma-4 unified multimodal: audio/vision embedders ship under
+            // model.embed_{audio,vision}.* (not under language_model/vision_tower).
+            // Not part of the text LM — skip.
+            if (name.compare(0, 18, "model.embed_audio.") == 0 ||
+                name.compare(0, 19, "model.embed_vision.") == 0) {
+                ++skipped;
+                continue;
+            }
+            if (name.compare(0, 4, "mtp.") == 0 ||
+                name.compare(0, 10, "model.mtp.") == 0) {
+                ++skipped;
+                continue;
+            }
+            const std::string lm_prefix = "model.language_model.";
+            if (name.compare(0, lm_prefix.size(), lm_prefix) == 0) {
+                name = "model." + name.substr(lm_prefix.size());
+            }
+            // Also handle top-level aliases the wrapper introduces.
+            if (name == "model.embed_tokens.weight" || name == "language_model.embed_tokens.weight") {
+                name = "model.embed_tokens.weight";
+            }
+        }
+
+        // Nemotron-H uses `backbone.embeddings/norm_f` for top-level and
+        // `backbone.layers.N.mixer.<sub>` for ALL per-layer weights (Mamba2,
+        // Attention, MoE all share the `mixer` namespace). Translate to the
+        // Qwen-style `model.layers.N.<self_attn|mamba|mlp>.<...>` so the
+        // existing matchers below pick up the weights. Without this, every
+        // tensor falls through to the "unrecognised layer weight" warning,
+        // tensors stay null on TransformerLayer fields, and the first forward
+        // hits an IMA accessing uninitialised memory.
+        if (is_nemotron_h) {
+            if (name == "backbone.embeddings.weight") {
+                name = "model.embed_tokens.weight";
+            } else if (name == "backbone.norm_f.weight") {
+                name = "model.norm.weight";
+            } else if (name.compare(0, 16, "backbone.layers.") == 0) {
+                std::vector<std::string> bp = split(name, '.');
+                // bp = [backbone, layers, N, ...]
+                if (bp.size() >= 4) {
+                    const std::string& layer_idx = bp[2];
+                    // backbone.layers.N.norm.weight → input layernorm
+                    if (bp.size() == 5 && bp[3] == "norm" && bp[4] == "weight") {
+                        name = "model.layers." + layer_idx + ".input_layernorm.weight";
+                    }
+                    // backbone.layers.N.mixer.<sub>.<...> → translated by sub-kind
+                    else if (bp.size() >= 5 && bp[3] == "mixer") {
+                        const std::string& sub = bp[4];
+                        std::string suffix;
+                        for (size_t i = 5; i < bp.size(); ++i) {
+                            suffix += '.';
+                            suffix += bp[i];
+                        }
+                        // Attention layer (the 6 starred layers in hybrid_pattern)
+                        if (sub == "q_proj" || sub == "k_proj" || sub == "v_proj" ||
+                            sub == "o_proj") {
+                            name = "model.layers.";
+                            name += layer_idx;
+                            name += ".self_attn.";
+                            name += sub;
+                            name += suffix;
+                        }
+                        // Mamba2 layer (in_proj/out_proj/conv1d/norm/A_log/D/dt_bias)
+                        else if (sub == "in_proj" || sub == "out_proj" || sub == "conv1d" ||
+                                 sub == "norm" || sub == "A_log" || sub == "D" ||
+                                 sub == "dt_bias") {
+                            name = "model.layers.";
+                            name += layer_idx;
+                            name += ".mamba.";
+                            name += sub;
+                            name += suffix;
+                        }
+                        // MoE router: mixer.gate.{weight,e_score_correction_bias}
+                        // We translate gate.weight→mlp.gate.weight (matches existing parser);
+                        // e_score_correction_bias becomes mlp.gate.bias so it routes to
+                        // moe_router_bias (DeepSeek-V2 style score correction).
+                        else if (sub == "gate") {
+                            if (suffix == ".e_score_correction_bias") {
+                                name = "model.layers." + layer_idx + ".mlp.gate.bias";
+                            } else {
+                                name = "model.layers.";
+                                name += layer_idx;
+                                name += ".mlp.gate";
+                                name += suffix;
+                            }
+                        }
+                        // MoE experts: mixer.experts.E.<rest> → mlp.experts.E.<rest>
+                        else if (sub == "experts") {
+                            name = "model.layers.";
+                            name += layer_idx;
+                            name += ".mlp.experts";
+                            name += suffix;
+                        }
+                        // Shared expert: mixer.shared_experts.<rest> → mlp.shared_expert.<rest>
+                        // (Nemotron uses plural; quench's matcher expects singular.)
+                        else if (sub == "shared_experts") {
+                            name = "model.layers.";
+                            name += layer_idx;
+                            name += ".mlp.shared_expert";
+                            name += suffix;
+                        }
+                        // Unknown subkey: fall through; will warn below.
+                    }
+                }
+            }
+        }
+
+        auto parts = split(name, '.');
+
+        // Stamped copy of the tensor with its semantic kind filled in.
+        // All field assignments below use `t` so that kind is preserved.
+        Tensor t = tensor;
+        t.kind = match_tensor_kind(name);
+
+        // -----------------------------------------------------------------
+        // Top-level (non-layer) weights
+        // -----------------------------------------------------------------
+        if (name == "model.embed_tokens.weight") {
+            model.tok_emb_ = t;
+            QUENCH_LOG_DEBUG("  assigned: %s -> tok_emb", name.c_str());
+            ++assigned;
+            continue;
+        }
+        if (name == "model.norm.weight") {
+            model.out_norm_ = t;
+            QUENCH_LOG_DEBUG("  assigned: %s -> out_norm", name.c_str());
+            ++assigned;
+            continue;
+        }
+        if (name == "lm_head.weight") {
+            model.out_proj_ = t;
+            QUENCH_LOG_DEBUG("  assigned: %s -> out_proj", name.c_str());
+            ++assigned;
+            continue;
+        }
+        // NVFP4 prequant LM head scales (Model Optimizer / llm-compressor).
+        // Routed into the load-time scratch map under key "out_proj"; Phase 0
+        // promote() in executor_pre_dequant.cu copies the device pointer onto
+        // model.out_proj_'s sidecars and clears the entry.
+        if (name == "lm_head.weight_scale" || name == "lm_head.weight_scale_2" ||
+            name == "lm_head.input_scale") {
+            const std::string kind = name.substr(8);  // strip "lm_head."
+            route_nvfp4_scale(model, "out_proj", kind, t);
+            QUENCH_LOG_DEBUG("  assigned: %s -> nvfp4_scratch_[out_proj].%s", name.c_str(), kind.c_str());
+            ++assigned;
+            continue;
+        }
+
+        // -----------------------------------------------------------------
+        // Layer weights: model.layers.{i}.<rest>
+        // -----------------------------------------------------------------
+        if (parts.size() < 4 || parts[0] != "model" || parts[1] != "layers") {
+            QUENCH_LOG_WARN("WeightMap: unrecognised weight name: %s", name.c_str());
+            ++skipped;
+            continue;
+        }
+
+        int layer_idx = parse_int(parts[2]);
+        if (layer_idx < 0) {
+            QUENCH_LOG_WARN("WeightMap: bad layer index in: %s", name.c_str());
+            ++skipped;
+            continue;
+        }
+        ensure_layer(model, layer_idx);
+        TransformerLayer& layer = model.layers_[layer_idx];
+
+        bool matched = false;
+
+        // -- Attention: self_attn.{q,k,v,o}_proj.weight --
+        // Also MLA (DeepSeek-V2/V3): kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj
+        if (parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "weight") {
+            const std::string& proj = parts[4];
+            if (proj == "q_proj") {
+                layer.wq = t;
+                matched = true;
+            } else if (proj == "k_proj") {
+                layer.wk = t;
+                matched = true;
+            } else if (proj == "v_proj") {
+                layer.wv = t;
+                matched = true;
+            } else if (proj == "o_proj") {
+                layer.wo = t;
+                matched = true;
+            } else if (proj == "kv_a_proj_with_mqa") {
+                // Packs latent(kv_lora_rank=512) + rope(qk_rope_head_dim=64) in one
+                // tensor. The split into latent vs rope happens at projection time
+                // (Task 2.3), not here.
+                layer.kv_a_proj = t;
+                matched = true;
+            } else if (proj == "kv_a_layernorm") {
+                // RMSNorm weight on the 512-dim latent. Norm weights are never
+                // quantized; leave as FP16/FP32.
+                layer.kv_a_layernorm = t;
+                matched = true;
+            } else if (proj == "kv_b_proj") {
+                layer.kv_b_proj = t;
+                matched = true;
+            } else if (proj == "qkv_proj") {
+                // Fused QKV (Phi-4): [Q+K+V, K_packed] → split into wq, wk, wv.
+                const auto& mc = model.config_;
+                int hd = mc.head_dim > 0 ? mc.head_dim : (mc.d_model / mc.n_heads);
+                int q_rows = mc.n_heads * hd;
+                int kv_rows = mc.n_kv_heads * hd;
+                size_t row_bytes = t.nbytes() / static_cast<size_t>(t.shape[0]);
+                if (t.shape[0] == q_rows + 2 * kv_rows) {
+                    layer.wq = t;
+                    layer.wq.shape[0] = q_rows;
+                    layer.wk = t;
+                    layer.wk.data = static_cast<char*>(t.data) + static_cast<size_t>(q_rows) * row_bytes;
+                    layer.wk.shape[0] = kv_rows;
+                    layer.wv = t;
+                    layer.wv.data = static_cast<char*>(t.data) + static_cast<size_t>(q_rows + kv_rows) * row_bytes;
+                    layer.wv.shape[0] = kv_rows;
+                    if (t.scales) {
+                        int64_t scale_cols = t.shape[1] / 8;
+                        size_t scale_row_bytes = static_cast<size_t>(scale_cols);
+                        layer.wk.scales = static_cast<char*>(t.scales) + static_cast<size_t>(q_rows) * scale_row_bytes;
+                        layer.wv.scales = static_cast<char*>(t.scales) + static_cast<size_t>(q_rows + kv_rows) * scale_row_bytes;
+                    }
+                    matched = true;
+                    QUENCH_LOG_DEBUG("  qkv_proj split: Q[%d] K[%d] V[%d]", q_rows, kv_rows, kv_rows);
+                }
+            }
+        }
+
+        // -- Attention norm: input_layernorm.weight --
+        if (!matched && parts.size() >= 5 && parts[3] == "input_layernorm" && parts[4] == "weight") {
+            layer.attn_norm = t;
+            matched = true;
+        }
+
+        // -- FFN norm: post_attention_layernorm.weight --
+        //    Llama convention: post_attention_layernorm is actually the pre-FFN norm.
+        //    Gemma 3/4 convention: post_attention_layernorm is the sandwich norm
+        //    applied AFTER attention output. Routed below in the Gemma-4 block.
+        if (!matched && !is_gemma4 && parts.size() >= 5 && parts[3] == "post_attention_layernorm" &&
+            parts[4] == "weight") {
+            layer.ffn_norm = t;
+            matched = true;
+        }
+
+        // -- Gemma 4 MoE: mlp.{gate,up,down}_proj.weight is the SHARED EXPERT,
+        //    NOT dense MLP. Route to w_*_shared instead. Must come before
+        //    the generic dense-MLP branch below. Dense Gemma-4 (31B) falls
+        //    through to the standard w_gate/w_up/w_down path.
+        if (!matched && is_gemma4_moe && parts.size() >= 6 && parts[3] == "mlp" && parts[5] == "weight") {
+            const std::string& proj = parts[4];
+            if (proj == "gate_proj") {
+                layer.w_gate_shared = t;
+                matched = true;
+            } else if (proj == "up_proj") {
+                layer.w_up_shared = t;
+                matched = true;
+            } else if (proj == "down_proj") {
+                layer.w_down_shared = t;
+                matched = true;
+            }
+        }
+
+        // -- Gemma 4: router + packed MoE experts + per-layer extras --
+        //    experts.gate_up_proj  (3D fused [n_exp, 2*moe_ff, d]) -> expert_gate_packed
+        //    experts.down_proj     (3D      [n_exp, d, moe_ff])    -> expert_down_packed
+        //    router.proj.weight    [n_exp, d]                      -> moe_gate
+        //    *_layernorm(_1|_2) variants                            -> ffn_{pre,post}_norm_{1,2}
+        //    post_attention_layernorm.weight                        -> post_attn_norm
+        if (!matched && is_gemma4) {
+            // experts.gate_up_proj / experts.down_proj
+            if (parts.size() >= 5 && parts[3] == "experts") {
+                if (parts[4] == "gate_up_proj") {
+                    layer.expert_gate_packed = t;
+                    // expert_up_packed left null → weight_upload splits the fused tensor
+                    matched = true;
+                } else if (parts[4] == "down_proj") {
+                    layer.expert_down_packed = t;
+                    matched = true;
+                }
+            }
+            // router.proj.weight (the gating matrix)
+            else if (parts.size() >= 6 && parts[3] == "router" && parts[4] == "proj" &&
+                     parts[5] == "weight") {
+                layer.moe_gate = t;
+                matched = true;
+            }
+            // router.scale  (per-channel router input scale == ffn_gate_inp.scale)
+            else if (parts.size() >= 5 && parts[3] == "router" && parts[4] == "scale") {
+                layer.ffn_gate_inp_scale = t;
+                matched = true;
+            }
+            // router.per_expert_scale  (per-expert down output scale)
+            else if (parts.size() >= 5 && parts[3] == "router" && parts[4] == "per_expert_scale") {
+                layer.expert_down_scale = t;
+                matched = true;
+            }
+            // layer_scalar  (per-layer output scalar)
+            else if (parts.size() >= 4 && parts[3] == "layer_scalar") {
+                layer.layer_out_scale = t;
+                matched = true;
+            }
+            // Gemma 4 FFN norm variants (parallel shared-MLP + MoE branches).
+            // GGUF analogue: pre_ffw_norm_2/post_ffw_norm_1/post_ffw_norm_2 are
+            // the parallel-branch norms; pre_feedforward_layernorm (base) and
+            // post_feedforward_layernorm (base) are the standard FFN norms,
+            // routed to layer.ffn_norm and layer.post_ffn_norm to mirror the
+            // GGUF loader (gguf_loader.cpp ffn_norm + post_ffw_norm fields).
+            else if (parts.size() >= 5 && parts[4] == "weight") {
+                if (parts[3] == "pre_feedforward_layernorm_2") {
+                    layer.ffn_pre_norm_2 = t;
+                    matched = true;
+                } else if (parts[3] == "post_feedforward_layernorm_1") {
+                    layer.ffn_post_norm_1 = t;
+                    matched = true;
+                } else if (parts[3] == "post_feedforward_layernorm_2") {
+                    layer.ffn_post_norm_2 = t;
+                    matched = true;
+                } else if (parts[3] == "pre_feedforward_layernorm") {
+                    layer.ffn_norm = t;
+                    matched = true;
+                } else if (parts[3] == "post_feedforward_layernorm") {
+                    layer.post_ffn_norm = t;
+                    matched = true;
+                } else if (parts[3] == "post_attention_layernorm") {
+                    // Gemma 3/4 sandwich norm — distinct from Llama's FFN norm.
+                    layer.post_attn_norm = t;
+                    matched = true;
+                }
+            }
+        }
+
+        // -- Dense MLP (Llama / Mistral / DeepSeek dense layers) --
+        if (!matched && parts.size() >= 6 && parts[3] == "mlp" && parts[5] == "weight") {
+            const std::string& proj = parts[4];
+            if (proj == "gate_proj") {
+                layer.w_gate = t;
+                matched = true;
+            } else if (proj == "up_proj") {
+                layer.w_up = t;
+                matched = true;
+            } else if (proj == "down_proj") {
+                layer.w_down = t;
+                matched = true;
+            } else if (proj == "gate_up_proj") {
+                // Fused gate+up (Phi-4): [2*d_ff, K_packed] → split into w_gate, w_up.
+                int64_t half_rows = t.shape[0] / 2;
+                int64_t cols = t.shape[1];
+                size_t row_bytes = t.nbytes() / static_cast<size_t>(t.shape[0]);
+                layer.w_gate = t;
+                layer.w_gate.shape[0] = half_rows;
+                layer.w_up = t;
+                layer.w_up.data = static_cast<char*>(t.data) + static_cast<size_t>(half_rows) * row_bytes;
+                layer.w_up.shape[0] = half_rows;
+                if (t.scales) {
+                    int64_t scale_cols = cols / 8;
+                    size_t scale_row_bytes = static_cast<size_t>(scale_cols);
+                    layer.w_up.scales = static_cast<char*>(t.scales) + static_cast<size_t>(half_rows) * scale_row_bytes;
+                }
+                matched = true;
+                QUENCH_LOG_DEBUG("  gate_up_proj split: gate[%lld] up[%lld]", (long long)half_rows, (long long)half_rows);
+            }
+        }
+
+        // -- NVFP4 scale tensors (ModelOpt pre-quantized) --
+        // self_attn.{q,k,v,o,kv_a_proj_with_mqa,kv_b_proj}_proj.{weight_scale,...}
+        // Note: kv_a_layernorm is a norm weight (never quantized) — no scale routing.
+        const std::string layer_key_prefix = "L" + std::to_string(layer_idx) + ".";
+
+        // self_attn.{q,k,v,o,...}_proj.{weight_scale,weight_scale_2,input_scale}
+        if (!matched && parts.size() >= 6 && parts[3] == "self_attn" &&
+            (parts[5] == "weight_scale" || parts[5] == "weight_scale_2" || parts[5] == "input_scale")) {
+            const std::string& proj = parts[4];
+            const std::string& kind = parts[5];
+            const char* slot = nullptr;
+            if (proj == "q_proj")
+                slot = "wq";
+            else if (proj == "k_proj")
+                slot = "wk";
+            else if (proj == "v_proj")
+                slot = "wv";
+            else if (proj == "o_proj")
+                slot = "wo";
+            // MLA: kv_a_proj_with_mqa packs latent+rope; route to kv_a_proj slot.
+            else if (proj == "kv_a_proj_with_mqa")
+                slot = "kv_a_proj";
+            // MLA: kv_b_proj is the up-projection (quantizable).
+            else if (proj == "kv_b_proj")
+                slot = "kv_b_proj";
+            // kv_a_layernorm is a norm weight — never quantized, no scale routing.
+            else if (proj == "qkv_proj") {
+                // Scalars (weight_scale_2, input_scale) are per-tensor → route to all
+                // three. weight_scale is per-group [Q+K+V, K/16]; slice it by output-row
+                // range so wk/wv each receive their own per-group scale and get promoted
+                // to NVFP4. (Previously the full fused scale went to wq only → wk/wv had
+                // no weight_scale in the scratch map → Phase 0 skipped promoting them →
+                // garbage K/V projections → degenerate output.)
+                if (kind == "weight_scale") {
+                    const auto& mc = model.config_;
+                    int hd = mc.head_dim > 0 ? mc.head_dim : (mc.d_model / mc.n_heads);
+                    int q_rows = mc.n_heads * hd;
+                    int kv_rows = mc.n_kv_heads * hd;
+                    size_t srow = static_cast<size_t>(t.shape[1]);  // UE4M3: 1 byte/group
+                    Tensor sq = t, sk = t, sv = t;
+                    sq.shape[0] = q_rows;
+                    sk.shape[0] = kv_rows;
+                    sk.data = static_cast<char*>(t.data) + static_cast<size_t>(q_rows) * srow;
+                    sv.shape[0] = kv_rows;
+                    sv.data = static_cast<char*>(t.data) + static_cast<size_t>(q_rows + kv_rows) * srow;
+                    route_nvfp4_scale(model, layer_key_prefix + "wq", kind, sq);
+                    route_nvfp4_scale(model, layer_key_prefix + "wk", kind, sk);
+                    route_nvfp4_scale(model, layer_key_prefix + "wv", kind, sv);
+                } else {
+                    route_nvfp4_scale(model, layer_key_prefix + "wq", kind, t);
+                    route_nvfp4_scale(model, layer_key_prefix + "wk", kind, t);
+                    route_nvfp4_scale(model, layer_key_prefix + "wv", kind, t);
+                }
+                matched = true;
+            }
+            if (slot) {
+                route_nvfp4_scale(model, layer_key_prefix + slot, kind, t);
+                matched = true;
+            }
+        }
+        // mlp.{gate,up,down}_proj.{weight_scale,weight_scale_2,input_scale}
+        if (!matched && parts.size() >= 6 && parts[3] == "mlp" &&
+            (parts[5] == "weight_scale" || parts[5] == "weight_scale_2" || parts[5] == "input_scale")) {
+            const std::string& proj = parts[4];
+            const std::string& kind = parts[5];
+            const char* slot = nullptr;
+            if (proj == "gate_proj")
+                slot = "w_gate";
+            else if (proj == "up_proj")
+                slot = "w_up";
+            else if (proj == "down_proj")
+                slot = "w_down";
+            else if (proj == "gate_up_proj") {
+                // weight_scale [2*ff, K/16] → slice into gate/up halves so w_up gets
+                // its own per-group scale and is promoted (was routed to w_gate only →
+                // w_up unpromoted → garbage up-projection). Scalars go to both.
+                if (kind == "weight_scale") {
+                    int64_t half = t.shape[0] / 2;
+                    size_t srow = static_cast<size_t>(t.shape[1]);
+                    Tensor sg = t, su = t;
+                    sg.shape[0] = half;
+                    su.shape[0] = half;
+                    su.data = static_cast<char*>(t.data) + static_cast<size_t>(half) * srow;
+                    route_nvfp4_scale(model, layer_key_prefix + "w_gate", kind, sg);
+                    route_nvfp4_scale(model, layer_key_prefix + "w_up", kind, su);
+                } else {
+                    route_nvfp4_scale(model, layer_key_prefix + "w_gate", kind, t);
+                    route_nvfp4_scale(model, layer_key_prefix + "w_up", kind, t);
+                }
+                matched = true;
+            }
+            if (slot) {
+                route_nvfp4_scale(model, layer_key_prefix + slot, kind, t);
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // MoE weights -- Mixtral style
+        //   block_sparse_moe.gate.weight               -> moe_gate
+        //   block_sparse_moe.experts.{e}.w1.weight      -> expert_w_gate[e]
+        //   block_sparse_moe.experts.{e}.w3.weight      -> expert_w_up[e]
+        //   block_sparse_moe.experts.{e}.w2.weight      -> expert_w_down[e]
+        // -----------------------------------------------------------------
+        if (!matched && parts[3] == "block_sparse_moe") {
+            if (parts.size() >= 6 && parts[4] == "gate" && parts[5] == "weight") {
+                layer.moe_gate = t;
+                matched = true;
+            } else if (parts.size() >= 8 && parts[4] == "experts" && parts[7] == "weight") {
+                int expert_idx = parse_int(parts[5]);
+                if (expert_idx >= 0) {
+                    ensure_expert(layer, expert_idx);
+                    const std::string& wname = parts[6];
+                    if (wname == "w1") {
+                        layer.expert_w_gate[expert_idx] = t;
+                        matched = true;
+                    } else if (wname == "w3") {
+                        layer.expert_w_up[expert_idx] = t;
+                        matched = true;
+                    } else if (wname == "w2") {
+                        layer.expert_w_down[expert_idx] = t;
+                        matched = true;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // MoE weights -- DeepSeek style
+        //   mlp.gate.weight                              -> moe_gate
+        //   mlp.gate.bias                                -> moe_router_bias
+        //   mlp.experts.{e}.gate_proj.weight             -> expert_w_gate[e]
+        //   mlp.experts.{e}.up_proj.weight               -> expert_w_up[e]
+        //   mlp.experts.{e}.down_proj.weight             -> expert_w_down[e]
+        //   mlp.shared_expert.{gate,up,down}_proj.weight -> w_{gate,up,down}_shared
+        // -----------------------------------------------------------------
+        if (!matched && parts[3] == "mlp") {
+            // MoE router: mlp.gate.weight
+            // Note: parts[4]=="gate" && parts[5]=="weight" with exactly 6 parts
+            // distinguishes from dense mlp.gate_proj.weight (which has
+            // parts[4]=="gate_proj").
+            if (parts.size() >= 6 && parts[4] == "gate" && parts[5] == "weight") {
+                layer.moe_gate = t;
+                matched = true;
+            }
+            // MoE router bias: mlp.gate.bias
+            else if (parts.size() >= 6 && parts[4] == "gate" && parts[5] == "bias") {
+                layer.moe_router_bias = t;
+                matched = true;
+            }
+            // MoE experts: mlp.experts.{e}.{gate_proj,up_proj,down_proj}.weight
+            else if (parts.size() >= 8 && parts[4] == "experts" && parts[7] == "weight") {
+                int expert_idx = parse_int(parts[5]);
+                if (expert_idx >= 0) {
+                    ensure_expert(layer, expert_idx);
+                    const std::string& proj = parts[6];
+                    if (proj == "gate_proj") {
+                        layer.expert_w_gate[expert_idx] = t;
+                        matched = true;
+                    } else if (proj == "up_proj") {
+                        layer.expert_w_up[expert_idx] = t;
+                        matched = true;
+                    } else if (proj == "down_proj") {
+                        layer.expert_w_down[expert_idx] = t;
+                        matched = true;
+                    }
+                }
+            }
+            // MoE expert NVFP4 scales: mlp.experts.{e}.{proj}.{weight_scale,weight_scale_2,input_scale}
+            else if (parts.size() >= 8 && parts[4] == "experts" &&
+                     (parts[7] == "weight_scale" || parts[7] == "weight_scale_2" ||
+                      parts[7] == "input_scale")) {
+                int expert_idx = parse_int(parts[5]);
+                if (expert_idx >= 0) {
+                    ensure_expert(layer, expert_idx);
+                    const std::string& proj = parts[6];
+                    const std::string& kind = parts[7];
+                    const char* slot = nullptr;
+                    if (proj == "gate_proj")
+                        slot = "expert_w_gate";
+                    else if (proj == "up_proj")
+                        slot = "expert_w_up";
+                    else if (proj == "down_proj")
+                        slot = "expert_w_down";
+                    if (slot) {
+                        route_nvfp4_scale(model, layer_key_prefix + slot + "." + std::to_string(expert_idx),
+                                          kind, t);
+                        matched = true;
+                    }
+                }
+            }
+            // Shared expert: mlp.shared_expert[s].{gate,up,down}_proj.weight
+            // DeepSeek-V2/V3 uses plural "shared_experts"; Qwen3/Nemotron use
+            // singular "shared_expert". Accept both.
+            else if (parts.size() >= 7 &&
+                     (parts[4] == "shared_expert" || parts[4] == "shared_experts") &&
+                     parts[6] == "weight") {
+                const std::string& proj = parts[5];
+                if (proj == "gate_proj") {
+                    layer.w_gate_shared = t;
+                    matched = true;
+                } else if (proj == "up_proj") {
+                    layer.w_up_shared = t;
+                    matched = true;
+                } else if (proj == "down_proj") {
+                    layer.w_down_shared = t;
+                    matched = true;
+                }
+            }
+            // Shared expert NVFP4 prequant scales (Qwen3.5/3.6 llm-compressor):
+            //   mlp.shared_expert[s].{proj}.{weight_scale,weight_scale_2,input_scale}
+            else if (parts.size() >= 7 &&
+                     (parts[4] == "shared_expert" || parts[4] == "shared_experts") &&
+                     (parts[6] == "weight_scale" || parts[6] == "weight_scale_2" ||
+                      parts[6] == "input_scale")) {
+                const std::string& proj = parts[5];
+                const std::string& kind = parts[6];
+                const char* slot = nullptr;
+                if (proj == "gate_proj")
+                    slot = "w_gate_shared";
+                else if (proj == "up_proj")
+                    slot = "w_up_shared";
+                else if (proj == "down_proj")
+                    slot = "w_down_shared";
+                if (slot) {
+                    route_nvfp4_scale(model, layer_key_prefix + slot, kind, t);
+                    matched = true;
+                }
+            }
+            // Shared-expert sigmoid gate (Qwen3-Next/3.5/3.6):
+            //   mlp.shared_expert_gate.weight   ->   shared_expert_gate_inp
+            else if (parts.size() >= 6 && parts[4] == "shared_expert_gate" && parts[5] == "weight") {
+                layer.shared_expert_gate_inp = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // MoE experts -- llm-compressor format (Gemma-4 NVFP4):
+        //   experts.{e}.{gate_proj,up_proj,down_proj}.weight         -> expert_w_gate/up/down[e]
+        //   experts.{e}.{proj}.{weight_scale,weight_scale_2,...}     -> expert_nvfp4_*[e]
+        // The standard format has mlp.experts.{e}.*, but llm-compressor omits the mlp. prefix.
+        // -----------------------------------------------------------------
+        if (!matched && parts[3] == "experts" && parts.size() >= 7) {
+            int expert_idx = parse_int(parts[4]);
+            if (expert_idx >= 0) {
+                const std::string& proj = parts[5];
+                const std::string& field = parts[6];
+                if (field == "weight") {
+                    ensure_expert(layer, expert_idx);
+                    if (proj == "gate_proj") {
+                        layer.expert_w_gate[expert_idx] = t;
+                        matched = true;
+                    } else if (proj == "up_proj") {
+                        layer.expert_w_up[expert_idx] = t;
+                        matched = true;
+                    } else if (proj == "down_proj") {
+                        layer.expert_w_down[expert_idx] = t;
+                        matched = true;
+                    }
+                } else if (field == "weight_scale" || field == "weight_scale_2" || field == "input_scale") {
+                    ensure_expert(layer, expert_idx);
+                    const char* slot = nullptr;
+                    if (proj == "gate_proj")
+                        slot = "expert_w_gate";
+                    else if (proj == "up_proj")
+                        slot = "expert_w_up";
+                    else if (proj == "down_proj")
+                        slot = "expert_w_down";
+                    if (slot) {
+                        const std::string layer_key_prefix2 = "L" + std::to_string(layer_idx) + ".";
+                        route_nvfp4_scale(model, layer_key_prefix2 + slot + "." + std::to_string(expert_idx),
+                                          field, t);
+                        matched = true;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // MoE router bias -- Mixtral style: block_sparse_moe.gate.bias
+        // -----------------------------------------------------------------
+        if (!matched && parts[3] == "block_sparse_moe" && parts.size() >= 6 && parts[4] == "gate" &&
+            parts[5] == "bias") {
+            layer.moe_router_bias = t;
+            matched = true;
+        }
+
+        // -----------------------------------------------------------------
+        // Attention biases -- Qwen2-style: self_attn.{q,k,v}_proj.bias
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "bias") {
+            const std::string& proj = parts[4];
+            if (proj == "q_proj") {
+                layer.q_bias = t;
+                matched = true;
+            } else if (proj == "k_proj") {
+                layer.k_bias = t;
+                matched = true;
+            } else if (proj == "v_proj") {
+                layer.v_bias = t;
+                matched = true;
+            } else if (proj == "o_proj") {
+                layer.o_bias = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // gpt-oss: attention sinks, router (weight+bias), pre-packed MXFP4
+        // experts. Blocks/scales land in the *_packed slots verbatim; the
+        // upload stage converts them to the NVFP4 expert cache (e2m1 nibbles
+        // are bit-identical, ue8m0 scales convert to e4m3 + tensor scale).
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 5 && parts[3] == "self_attn" && parts[4] == "sinks") {
+            layer.attn_sinks = t;
+            matched = true;
+        }
+        if (!matched && parts.size() >= 6 && parts[3] == "mlp" && parts[4] == "router") {
+            if (parts[5] == "weight") {
+                layer.moe_gate = t;
+                matched = true;
+            } else if (parts[5] == "bias") {
+                layer.router_bias = t;
+                matched = true;
+            }
+        }
+        if (!matched && parts.size() >= 6 && parts[3] == "mlp" && parts[4] == "experts") {
+            const std::string& field = parts[5];
+            if (field == "gate_up_proj_blocks") {
+                layer.expert_gate_up_packed_blocks = t;
+                matched = true;
+            } else if (field == "gate_up_proj_scales") {
+                layer.expert_gate_up_packed_scales = t;
+                matched = true;
+            } else if (field == "gate_up_proj_bias") {
+                layer.expert_gate_up_bias_fused = t;
+                matched = true;
+            } else if (field == "down_proj_blocks") {
+                layer.expert_down_packed_blocks = t;
+                matched = true;
+            } else if (field == "down_proj_scales") {
+                layer.expert_down_packed_scales = t;
+                matched = true;
+            } else if (field == "down_proj_bias") {
+                layer.expert_down_bias = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // QK-Norm -- Qwen3-style: self_attn.{q,k}_norm.weight
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 6 && parts[3] == "self_attn" && parts[5] == "weight") {
+            const std::string& proj = parts[4];
+            if (proj == "q_norm") {
+                layer.attn_q_norm = t;
+                matched = true;
+            } else if (proj == "k_norm") {
+                layer.attn_k_norm = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Gated DeltaNet (linear-attention) layers -- Qwen3.5/3.6 SafeTensors:
+        //   linear_attn.in_proj_qkv.weight   -> ssm_in   (fused Q,K,V)
+        //   linear_attn.in_proj_a.weight     -> gdn_alpha
+        //   linear_attn.in_proj_b.weight     -> gdn_beta
+        //   linear_attn.in_proj_z.weight     -> gdn_gate (output gate / z)
+        //   linear_attn.out_proj.weight      -> ssm_out
+        //   linear_attn.conv1d.weight        -> ssm_conv1d_w
+        //   linear_attn.conv1d.bias          -> ssm_conv1d_b   (if present)
+        //   linear_attn.norm.weight          -> ssm_norm_w
+        //   linear_attn.A_log                -> ssm_a
+        //   linear_attn.dt_bias              -> ssm_dt_b
+        // The Qwen3.6 GGUF layout splits the same weights across mamba.* +
+        // temporal_block.{gate_proj,alpha,beta}.weight; we route the
+        // SafeTensors variants to the same TransformerLayer slots so the
+        // existing GGUF forward path applies unchanged.
+        if (!matched && parts[3] == "linear_attn" && parts.size() >= 5) {
+            const std::string& proj = parts[4];
+            // 5-part forms: linear_attn.A_log / linear_attn.dt_bias
+            if (parts.size() == 5) {
+                if (proj == "A_log") {
+                    layer.ssm_a = t;
+                    matched = true;
+                } else if (proj == "dt_bias") {
+                    layer.ssm_dt_b = t;
+                    matched = true;
+                }
+            }
+            // 6-part forms: linear_attn.<proj>.weight | conv1d.bias
+            else if (parts.size() >= 6) {
+                const std::string& kind = parts[5];
+                if (kind == "weight") {
+                    if (proj == "in_proj_qkv") {
+                        layer.ssm_in = t;
+                        matched = true;
+                    } else if (proj == "in_proj_a") {
+                        layer.gdn_alpha = t;
+                        matched = true;
+                    } else if (proj == "in_proj_b") {
+                        layer.gdn_beta = t;
+                        matched = true;
+                    } else if (proj == "in_proj_z") {
+                        layer.gdn_gate = t;
+                        matched = true;
+                    } else if (proj == "out_proj") {
+                        layer.ssm_out = t;
+                        matched = true;
+                    } else if (proj == "conv1d") {
+                        layer.ssm_conv1d_w = t;
+                        matched = true;
+                    } else if (proj == "norm") {
+                        layer.ssm_norm_w = t;
+                        matched = true;
+                    }
+                } else if (kind == "bias" && proj == "conv1d") {
+                    layer.ssm_conv1d_b = t;
+                    matched = true;
+                } else if (kind == "weight_scale" || kind == "weight_scale_2" ||
+                           kind == "input_scale") {
+                    // NVFP4-quantized GDN (linear_attn) projection scales. Route to
+                    // nvfp4_scratch_ so Phase-0 promote() attaches them. in_proj_a/b
+                    // (gdn_alpha/beta) are FP16_ONLY → dequant→FP16 at load; the rest
+                    // (ssm_in/ssm_out/gdn_gate) run native NVFP4 like Nemotron-H Mamba2.
+                    const char* slot = nullptr;
+                    if (proj == "in_proj_qkv")
+                        slot = "ssm_in";
+                    else if (proj == "in_proj_a")
+                        slot = "gdn_alpha";
+                    else if (proj == "in_proj_b")
+                        slot = "gdn_beta";
+                    else if (proj == "in_proj_z")
+                        slot = "gdn_gate";
+                    else if (proj == "out_proj")
+                        slot = "ssm_out";
+                    if (slot) {
+                        route_nvfp4_scale(model, layer_key_prefix + slot, kind, t);
+                        matched = true;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Post-layer norms -- Gemma-3 style
+        //   post_feedforward_layernorm.weight  -> post_ffn_norm
+        //   pre_feedforward_layernorm.weight   -> ffn_norm (Gemma variant)
+        //   post_attention_layernorm.weight     (already handled as ffn_norm above)
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 5 && parts[4] == "weight") {
+            if (parts[3] == "post_feedforward_layernorm") {
+                layer.post_ffn_norm = t;
+                matched = true;
+            } else if (parts[3] == "pre_feedforward_layernorm") {
+                layer.ffn_norm = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // GPTQ weights: self_attn.{q,k,v,o}_proj.{qweight,qzeros,scales,g_idx}
+        //               mlp.{gate,up,down}_proj.{qweight,qzeros,scales,g_idx}
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 6 && parts[3] == "self_attn") {
+            const std::string& proj = parts[4];
+            TransformerLayer::GPTQWeight* gptq = nullptr;
+            if (proj == "q_proj")
+                gptq = &layer.gptq_q;
+            else if (proj == "k_proj")
+                gptq = &layer.gptq_k;
+            else if (proj == "v_proj")
+                gptq = &layer.gptq_v;
+            else if (proj == "o_proj")
+                gptq = &layer.gptq_o;
+            matched = assign_gptq_field(gptq, parts[5], t);
+        }
+
+        if (!matched && parts.size() >= 6 && parts[3] == "mlp") {
+            const std::string& proj = parts[4];
+            TransformerLayer::GPTQWeight* gptq = nullptr;
+            if (proj == "gate_proj")
+                gptq = &layer.gptq_gate;
+            else if (proj == "up_proj")
+                gptq = &layer.gptq_up;
+            else if (proj == "down_proj")
+                gptq = &layer.gptq_down;
+            matched = assign_gptq_field(gptq, parts[5], t);
+        }
+
+        // -----------------------------------------------------------------
+        // GDN (Gated DeltaNet / Qwen3.5) weights
+        //   temporal_block.gate_proj.weight  -> gdn_gate
+        //   temporal_block.alpha.weight      -> gdn_alpha
+        //   temporal_block.beta.weight       -> gdn_beta
+        // -----------------------------------------------------------------
+        if (!matched && parts.size() >= 6 && parts[3] == "temporal_block" && parts[5] == "weight") {
+            const std::string& proj = parts[4];
+            if (proj == "gate_proj") {
+                layer.gdn_gate = t;
+                matched = true;
+            } else if (proj == "alpha") {
+                layer.gdn_alpha = t;
+                matched = true;
+            } else if (proj == "beta") {
+                layer.gdn_beta = t;
+                matched = true;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // SSM (Mamba2 / Nemotron-H) weights
+        //   mamba.in_proj.weight   -> ssm_in
+        //   mamba.out_proj.weight  -> ssm_out
+        //   mamba.conv1d.weight    -> ssm_conv1d_w
+        //   mamba.conv1d.bias      -> ssm_conv1d_b
+        //   mamba.dt_bias          -> ssm_dt_b
+        //   mamba.A_log            -> ssm_a
+        //   mamba.D                -> ssm_d
+        //   mamba.norm.weight      -> ssm_norm_w
+        // -----------------------------------------------------------------
+        if (!matched && parts[3] == "mamba") {
+            if (parts.size() >= 6 && parts[5] == "weight") {
+                const std::string& proj = parts[4];
+                if (proj == "in_proj") {
+                    layer.ssm_in = t;
+                    matched = true;
+                } else if (proj == "out_proj") {
+                    layer.ssm_out = t;
+                    matched = true;
+                } else if (proj == "conv1d") {
+                    layer.ssm_conv1d_w = t;
+                    matched = true;
+                } else if (proj == "norm") {
+                    layer.ssm_norm_w = t;
+                    matched = true;
+                }
+            } else if (parts.size() >= 6 && parts[4] == "conv1d" && parts[5] == "bias") {
+                layer.ssm_conv1d_b = t;
+                matched = true;
+            } else if (parts.size() >= 5 && parts[4] == "dt_bias") {
+                layer.ssm_dt_b = t;
+                matched = true;
+            } else if (parts.size() >= 5 && parts[4] == "A_log") {
+                layer.ssm_a = t;
+                matched = true;
+            } else if (parts.size() >= 5 && parts[4] == "D") {
+                layer.ssm_d = t;
+                matched = true;
+            }
+            // Mamba2 NVFP4 prequant scales: mamba.{in_proj,out_proj}.{weight_scale,weight_scale_2,input_scale}
+            // Route to nvfp4_scratch_ under "L<i>.ssm_in/ssm_out" so the
+            // pre-dequant promote() in executor_pre_dequant.cu attaches them
+            // to the SSM tensor sidecars (needed for load-time dequant since
+            // SSM weights are excluded from the NVFP4 cache for accuracy).
+            else if (!matched && parts.size() >= 6 &&
+                     (parts[5] == "weight_scale" || parts[5] == "weight_scale_2" ||
+                      parts[5] == "input_scale")) {
+                const std::string& proj = parts[4];
+                const std::string& kind = parts[5];
+                const char* slot = nullptr;
+                if (proj == "in_proj")
+                    slot = "ssm_in";
+                else if (proj == "out_proj")
+                    slot = "ssm_out";
+                if (slot) {
+                    route_nvfp4_scale(model, layer_key_prefix + slot, kind, t);
+                    matched = true;
+                }
+            }
+        }
+
+        if (matched) {
+            QUENCH_LOG_DEBUG("  assigned: %s -> layer %d", name.c_str(), layer_idx);
+            ++assigned;
+        } else {
+            QUENCH_LOG_WARN("WeightMap: unrecognised layer weight: %s", name.c_str());
+            ++skipped;
+        }
+    }
+
+    // Update n_layers in the config to reflect what we actually loaded.
+    model.config_.n_layers = static_cast<int>(model.layers_.size());
+
+    // Update n_experts from the first layer that has experts.
+    for (auto& layer : model.layers_) {
+        int ne = static_cast<int>(layer.expert_w_gate.size());
+        if (ne > 0) {
+            model.config_.n_experts = std::max(model.config_.n_experts, ne);
+        }
+    }
+
+    QUENCH_LOG_INFO(
+        "WeightMap (%s): assigned %d tensors, skipped %d, "
+        "layers=%d, experts=%d",
+        model_arch_name(arch_), assigned, skipped, model.config_.n_layers, model.config_.n_experts);
+
+    // Vision tower, when the config loader recognised one. Its weights ride in
+    // the same shard map as the LM's — that is why Model owns it — but they are
+    // routed by their own mapper, not by the LM matchers above.
+    if (model.vision_tower) {
+        Qwen3VLVisionLoadStats vstats;
+        std::string verr;
+        if (load_qwen3vl_vision_tensors(tensors, *model.vision_tower, vstats, verr)) {
+            QUENCH_LOG_INFO("Vision tower: %d tensors assigned (%zu blocks, %zu deepstack mergers)",
+                         vstats.assigned, model.vision_tower->layers.size(),
+                         model.vision_tower->deepstack_mergers.size());
+        } else {
+            // Drop it rather than hand the encoder a tower with null slots —
+            // that would surface as a garbage embedding many layers later.
+            QUENCH_LOG_WARN(
+                "Vision tower incomplete (%s; %d assigned, %d unknown, %d missing) — "
+                "continuing text-only",
+                verr.c_str(), vstats.assigned, vstats.unknown, vstats.missing);
+            model.vision_tower.reset();
+        }
+    }
+
+    // A MoE model whose experts were all skipped loads, runs, and answers with
+    // garbage — the routing picks experts that are null tensors. Measured on
+    // gpt-oss-20b in BF16, whose experts are 3-D stacks (`experts.gate_up_proj`)
+    // that only the MXFP4 `_blocks`/`_scales` matcher looks for: every layer
+    // logged "unrecognised layer weight", the load succeeded, and generation
+    // produced ":!!!!!!!!!!".
+    //
+    // Deliberately narrow: it fires only when the config declares experts and
+    // NOT ONE layer carries any expert representation — per-expert 2-D, the
+    // Gemma-4 packed pair, or the gpt-oss packed blocks. A partially mapped MoE
+    // is a different question and stays a warning.
+    if (model.config_.n_experts > 0) {
+        // The per-expert vectors are RESIZED by `ensure_expert` as soon as any
+        // expert-shaped name is seen, so a non-empty vector says nothing — the
+        // entries can all be default Tensors. Only a non-null `data` means a
+        // weight actually arrived.
+        bool any_experts = false;
+        for (const auto& layer : model.layers_) {
+            for (const auto& w : layer.expert_w_gate) {
+                if (w.data) {
+                    any_experts = true;
+                    break;
+                }
+            }
+            if (any_experts || layer.expert_gate_packed.data || layer.expert_gate_up_packed_blocks.data ||
+                layer.expert_down_packed.data || layer.expert_down_packed_blocks.data) {
+                any_experts = true;
+                break;
+            }
+        }
+        if (!any_experts) {
+            QUENCH_LOG_ERROR(
+                "WeightMap: the config declares %d experts per layer but not one expert tensor was "
+                "recognised (%d tensors skipped). This checkpoint stores its experts in a layout quench "
+                "does not read — loading it would route through null experts and generate garbage.",
+                model.config_.n_experts, skipped);
+            return false;
+        }
+    }
+
+    if (assigned == 0) {
+        QUENCH_LOG_ERROR("WeightMap: no tensors were assigned -- check weight names");
+        return false;
+    }
+
+    // Validate that essential weights were populated.
+    if (!model.tok_emb_.data) {
+        QUENCH_LOG_WARN("WeightMap: token embedding (tok_emb) was not found");
+    }
+    if (!model.out_norm_.data) {
+        QUENCH_LOG_WARN("WeightMap: output norm (out_norm) was not found");
+    }
+    if (!model.out_proj_.data) {
+        // Some models tie lm_head to embed_tokens.
+        QUENCH_LOG_WARN(
+            "WeightMap: output projection (out_proj) was not found "
+            "(may be tied to embed_tokens)");
+    }
+
+    return true;
+}
+
+}  // namespace quench

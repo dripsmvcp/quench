@@ -1,0 +1,96 @@
+#pragma once
+
+#include "quench/types.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    // Device
+    int device_id;
+
+    // Memory
+    size_t kv_cache_max_blocks;  // Max KV cache blocks, 0 = auto
+
+    // Inference
+    int max_batch_size;
+    int max_seq_len;
+    QuenchDType compute_dtype;  // FP16, BF16, or FP8_E4M3
+
+    // Sampling defaults
+    float temperature;
+    float top_p;
+    int top_k;
+    int max_tokens;
+
+    // CUDA 13.1 features
+    int enable_green_contexts;      // 0 = off, 1 = on
+    float green_ctx_prefill_ratio;  // SM ratio for prefill (default 0.8)
+    int enable_pdl;                 // Programmatic Dependent Launch
+    int enable_cuda_graphs;         // CUDA Graph capture for decode
+
+    // Layer offloading
+    int gpu_layers;  // Layers to keep on GPU (-1 = all, 0 = all offloaded)
+
+    // KV cache precision
+    QuenchDType kv_cache_dtype;  // FP16 (default), FP8_E4M3, INT8, INT4, NVFP4, or MXFP4_KV
+
+    // SSM state precision
+    QuenchDType ssm_state_dtype;  // FP32 (default) or FP16 for SSM h_state
+
+    // VRAM budget
+    size_t vram_budget_mb;  // Max GPU memory to use (MiB), 0 = use all available
+
+    // Chunked prefill
+    int prefill_chunk_size;  // Max tokens per prefill chunk.
+                             //   -1 = use per-arch default (recommended)
+                             //   0  = explicit single-chunk (force)
+                             //   >0 = explicit chunk size (rejected with WARN if arch unsupported)
+
+    // Prefill weight cache precision
+    int use_fp8_prefill;  // 0 = FP16 weight cache (default), 1 = FP8 E4M3 prefill cache
+
+    // NVFP4 decode weight cache
+    int use_nvfp4_decode;  // -1 = auto (by quant/MoE/GDN: dense Q*_K→1, sub-8-bit/MoE/GDN→2), 0 = off, 1 = additive, 2 = NVFP4 only
+
+    // MXFP4 prefill: use CUTLASS MXFP4 GEMM for prefill (converts NVFP4 cache to MXFP4 format)
+    int use_mxfp4_prefill;  // 0 = off (default), 1 = on (requires sm_120 + NVFP4 cache)
+
+    // Dual-path quantization: FP8 for attention weights (WQ/WK/WV/WO), NVFP4 for FFN weights
+    int dual_path_quant;  // 0 = off (default), 1 = on (attention stays FP8, FFN gets NVFP4)
+
+    // KV cache minimum context budget
+    int min_kv_tokens;  // Minimum KV cache capacity in tokens (0 = auto).
+                        // Budget planner guarantees at least this many tokens
+                        // before allocating weight caches. Default auto picks
+                        // a reasonable minimum based on model size.
+
+    // Prefix caching
+    int use_prefix_caching;       // 0 = off (default), 1 = on — reuse KV blocks for shared prefixes
+    char prefix_cache_path[512];  // path to save/load prefix cache (empty = disabled)
+    int prefix_pin_budget_pct;    // cap on cache_control-pinned blocks, % of KV pool (default 25)
+
+    // StreamingLLM smart KV cache (Xiao et al., 2023):
+    // attention sinks + sliding window. Reduces decode KV bandwidth and frees
+    // middle KV blocks for long generations. Currently active only for the FP16
+    // GQA decode path; other quantized variants ignore these settings.
+    int streaming_kv_enabled;    // 0 = off (default), 1 = on
+    int streaming_kv_auto;       // 1 = auto-enable when KV cache >90% full (default)
+    int streaming_kv_n_sinks;    // # of initial tokens to always keep (default 4)
+    int streaming_kv_window;     // sliding window size (0 = use ModelConfig::sliding_window)
+    int streaming_kv_threshold;  // ctx_len at which streaming activates
+                                 // (0 = auto: n_sinks + window + 2*kKVBlockSize)
+
+    // Vision (multimodal)
+    const char* mmproj_path;  // Path to mmproj GGUF file (NULL = text-only)
+} QuenchConfig;
+
+// Returns a config with sensible defaults
+QuenchConfig quench_config_default(void);
+
+#ifdef __cplusplus
+}
+#endif

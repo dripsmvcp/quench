@@ -1,0 +1,235 @@
+#pragma once
+
+#include "quench/types.h"
+#include "quench/config.h"
+#include "quench/error.h"
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Thread-safety contract:
+ *
+ * - QuenchModel handles are read-only after creation and safe to share
+ *   across threads.
+ * - QuenchContext handles are NOT thread-safe. Each context must be used
+ *   from a single thread at a time. Create one context per thread for
+ *   concurrent inference.
+ * - quench_model_load() and quench_model_free() are NOT thread-safe with
+ *   respect to the same model handle.
+ * - Global state (CUDA device, cuBLAS handles) is initialized once
+ *   during the first quench_context_create() call.
+ */
+
+// Opaque handles
+typedef struct QuenchModel_T* QuenchModel;
+typedef struct QuenchContext_T* QuenchContext;
+
+// --- Model Loading ---
+
+QuenchError quench_model_load(const char* path, QuenchModelFormat format, QuenchModel* out_model);
+
+// Like quench_model_load, but lets the caller opt into loading the MTP
+// (multi-token-prediction) head sidecar for SafeTensors models that ship one
+// (DeepSeek-V3 family, e.g. Qwen3.6). The head is ~1.57 GiB BF16 of VRAM and is
+// only useful when MTP spec-decode is subsequently enabled via
+// quench_enable_mtp_spec_decode. quench_model_load() is equivalent to passing
+// load_mtp_head=0. Has no effect for GGUF or models without an MTP sidecar.
+QuenchError quench_model_load_ex(const char* path, QuenchModelFormat format, int load_mtp_head,
+                           QuenchModel* out_model);
+
+void quench_model_free(QuenchModel model);
+
+// Query model metadata
+QuenchModelArch quench_model_arch(QuenchModel model);
+int quench_model_n_layers(QuenchModel model);
+int quench_model_d_model(QuenchModel model);
+int quench_model_vocab_size(QuenchModel model);
+int quench_model_max_seq_len(QuenchModel model);
+/* Effective context window the engine actually allocated for this context
+ * (VRAM-aware auto-sizing). May be smaller than quench_model_max_seq_len when VRAM
+ * is tight; gate prompt length on this to reject over-long prompts cleanly. */
+int quench_context_max_seq_len(QuenchContext ctx);
+/* BOS token id when the model's tokenizer prepends one (add_bos), else -1.
+ * Teacher-forced eval (perplexity) must prepend it for BOS-dependent
+ * families (Gemma, Llama) or the NLL measures an out-of-distribution
+ * sequence. */
+int32_t quench_model_bos_token(QuenchModel model);
+
+/* --- LoRA adapters (runtime low-rank deltas, no weight patching) ---
+ * quench_lora_load: load a HuggingFace PEFT adapter directory (or a bare
+ * adapter_model.safetensors). Returns an adapter id >= 1 via out_id.
+ * quench_lora_set: activate an adapter (0 = base model). Swapping re-captures
+ * decode CUDA graphs on the next request — swap between requests, not
+ * mid-generation. Adapters live until the context is freed. */
+QuenchError quench_lora_load(QuenchContext ctx, const char* path, int32_t* out_id);
+QuenchError quench_lora_set(QuenchContext ctx, int32_t adapter_id);
+
+// --- Context / Runtime ---
+
+QuenchError quench_context_create(QuenchModel model, const QuenchConfig* config, QuenchContext* out_ctx);
+
+void quench_context_free(QuenchContext ctx);
+
+// --- Generation ---
+
+typedef struct {
+    float temperature;
+    float top_p;
+    int top_k;
+    int max_tokens;
+    int seed;                  // -1 = random
+    float min_p;               // min probability threshold (0 = disabled)
+    float typical_p;           // locally typical sampling (1.0 = disabled)
+    float repetition_penalty;  // >1 penalizes repeats (1.0 = disabled)
+    float frequency_penalty;   // subtractive per-occurrence (0 = disabled)
+    float presence_penalty;    // subtractive binary (0 = disabled)
+    int repeat_last_n;         // penalty window: scan last N tokens (0 = all)
+    float dry_multiplier;      // DRY penalty scale (0 = disabled)
+    float dry_base;            // DRY exponential base (default 1.75)
+    int dry_allowed_length;    // N-gram lengths ≤ this not penalized (default 2)
+    int dry_penalty_last_n;    // How far back to scan (0 = all)
+    int mirostat;              // 0 = off, 2 = Mirostat v2
+    float mirostat_tau;        // target entropy (default 5.0)
+    float mirostat_eta;        // learning rate (default 0.1)
+    int apply_chat_template;   // 1 = yes (default), 0 = no
+    int ignore_eos;            // 1 = don't stop on EOS (benchmark mode)
+    int logprobs;              // 1 = return logprobs, 0 = off
+    int top_logprobs;          // 0-20, number of top alternatives
+    int json_mode;             // 1 = constrain output to valid JSON
+} QuenchGenerateParams;
+
+QuenchGenerateParams quench_generate_params_default(void);
+
+// Callback for streaming token output. Return 0 to continue, non-zero to stop.
+typedef int (*QuenchTokenCallback)(const char* text, size_t len, void* user_data);
+
+// Synchronous generation with streaming callback. Calls cb for each generated token.
+QuenchError quench_generate_streaming(QuenchContext ctx, const char* prompt, const QuenchGenerateParams* params,
+                                QuenchTokenCallback cb, void* user_data);
+
+// Synchronous generation from a text prompt
+QuenchError quench_generate(QuenchContext ctx, const char* prompt, const QuenchGenerateParams* params, char* output_buf,
+                      size_t output_buf_size, size_t* output_len);
+
+// Token-level generation
+QuenchError quench_tokenize(QuenchModel model, const char* text, int32_t* tokens, int* n_tokens, int max_tokens);
+
+QuenchError quench_detokenize(QuenchModel model, const int32_t* tokens, int n_tokens, char* output_buf,
+                        size_t output_buf_size);
+
+// Prefill: process input tokens, populate KV cache.
+// NOTE: prefill samples the FIRST output token; without `params` the request
+// inherits Request struct defaults (top_p=1, top_k=0) and ignores caller
+// sampling choices for that first token. Quantized MoE models with noisy
+// logit tails (Gemma-4-NVFP4, Qwen3-Coder-NVFP4) can produce a degenerate
+// first token under those defaults. Use quench_prefill_with_params instead and
+// pass the same params you will hand to quench_decode_step.
+QuenchError quench_prefill(QuenchContext ctx, const int32_t* tokens, int n_tokens);
+
+// Prefill that applies caller-supplied sampling params to the first-token
+// sample at end of the last prefill chunk. Strongly preferred over
+// quench_prefill for any path that uses non-default temperature/top_p/top_k.
+// `params` may be NULL (degrades to quench_prefill semantics).
+QuenchError quench_prefill_with_params(QuenchContext ctx, const int32_t* tokens, int n_tokens,
+                                 const QuenchGenerateParams* params);
+
+// Decode: generate one token.
+// Returns QUENCH_ERROR_CANCELLED when the engine had to cancel the request —
+// e.g. the KV pool is exhausted mid-decode (reject-newest; the engine log
+// names the cause and remedy). QUENCH_ERROR_INTERNAL after natural FINISH is
+// the end-of-stream signal for callers that keep stepping.
+QuenchError quench_decode_step(QuenchContext ctx, const QuenchGenerateParams* params, int32_t* out_token);
+
+// Teacher-forced perplexity over tokens[0..n_tokens-1] (eval/bench).
+// Resets context, runs a SINGLE-CHUNK prefill (so all-position hidden survives),
+// applies the LM head to every position, and returns PPL in *out_ppl.
+// Requires n_tokens <= the model's max prefill length. *out_ppl < 0 on failure.
+QuenchError quench_perplexity(QuenchContext ctx, const int32_t* tokens, int n_tokens, double* out_ppl);
+
+// Write the activation-calibration statistics collected so far to `path`
+// (see `[calibration] enabled`). Input to quench-quantize's AWQ scale search.
+// Returns QUENCH_ERROR_INVALID_ARG when calibration was never enabled or no
+// forward pass has run, so an empty file can never pass for a valid one.
+QuenchError quench_calibration_write(QuenchContext ctx, const char* path);
+
+// Reset context state (clear KV cache etc.)
+QuenchError quench_context_reset(QuenchContext ctx);
+
+// Enable MTP-based speculative decoding (DeepSeek-V3-family models, e.g.
+// Qwen3.6 with `model_mtp.safetensors`). k = draft length (1-4 typical).
+// Returns QUENCH_ERROR_INVALID_ARGUMENT if model has no MTP head loaded.
+// Phase 3 scaffolding: API in place, auto-invocation from decode loop is
+// Phase 4 production work (currently Phase 5 smoke tests use the C++ API).
+QuenchError quench_enable_mtp_spec_decode(QuenchContext ctx, int k);
+
+// --- Vision (Multimodal) ---
+
+// Set an image for the next generation. Must be called after quench_context_create
+// and before quench_generate/quench_generate_streaming. Only valid when mmproj was
+// loaded during context creation. Pass NULL to clear the image.
+QuenchError quench_set_image(QuenchContext ctx, const char* image_path);
+
+// Set image from raw memory (e.g. decoded base64). Pass NULL/0 to clear.
+QuenchError quench_set_image_from_memory(QuenchContext ctx, const uint8_t* data, size_t len);
+
+// Append an image instead of replacing the pending one, so a prompt can carry
+// several. They are consumed in the order added, one per placeholder.
+// QUENCH_ERROR_UNSUPPORTED on a model whose vision tower takes a single image
+// (the mmproj path) — refused rather than silently keeping only one.
+QuenchError quench_add_image(QuenchContext ctx, const char* image_path);
+QuenchError quench_add_image_from_memory(QuenchContext ctx, const uint8_t* data, size_t len);
+
+// Number of image tokens the pending image expands to, 0 if none. Dynamic-
+// resolution encoders (Qwen3-VL) only know this after the image is set, and the
+// prompt has to reserve exactly this many placeholders — so call it between
+// quench_set_image and tokenizing.
+int quench_pending_image_tokens(QuenchContext ctx);
+
+// --- Suspend to RAM (weight snapshot) ---
+//
+// Flow (see quench-server /admin/suspend and /admin/resume):
+//   1. quench_weights_snapshot_capture(model, headroom_mb, &snap)  — D2H copy of
+//      the post-upload weight buffers into pageable host RAM. Model/engine
+//      still fully alive; on failure nothing was torn down.
+//   2. quench_context_free(ctx); quench_model_free(model);            — free VRAM.
+//   3. quench_gpu_release(1);                                      — trim pools,
+//      optional cudaDeviceReset so the process holds ~0 MiB VRAM.
+//   4. later: quench_weights_snapshot_arm(snap); then reload the SAME model file
+//      (quench_model_load + quench_context_create). The weight upload restores
+//      buffer bytes from the snapshot instead of re-reading + re-converting;
+//      any per-tensor mismatch silently falls back to the normal cold path.
+//   5. quench_weights_snapshot_free(snap);
+//
+// Capture errors: QUENCH_ERROR_UNSUPPORTED for models whose device weight buffers
+// were transformed in place after upload (native MXFP4 GGUF, gpt-oss, Gemma-4
+// fused-expert split), QUENCH_ERROR_OUT_OF_MEMORY when host MemAvailable is
+// insufficient (snapshot bytes + headroom_mb).
+typedef struct QuenchWeightSnapshot_T* QuenchWeightSnapshot;
+
+QuenchError quench_weights_snapshot_capture(QuenchModel model, size_t host_ram_headroom_mb,
+                                      QuenchWeightSnapshot* out_snap);
+// Arm for the NEXT model load in this process (non-consuming: the snapshot
+// stays owned by the caller and can be re-armed after a failed resume).
+QuenchError quench_weights_snapshot_arm(QuenchWeightSnapshot snap);
+void quench_weights_snapshot_free(QuenchWeightSnapshot snap);
+size_t quench_weights_snapshot_bytes(QuenchWeightSnapshot snap);
+// Number of uploads restored from this snapshot by the last armed consume.
+int quench_weights_snapshot_hits(QuenchWeightSnapshot snap);
+
+// Release process-held GPU resources after model/context teardown: syncs,
+// trims the async mempool, and (device_reset != 0) resets the CUDA primary
+// context so nvidia-smi shows ~0 MiB for this process. After a reset the next
+// quench_model_load/quench_context_create re-initializes CUDA state from scratch.
+QuenchError quench_gpu_release(int device_reset);
+
+// --- Version ---
+const char* quench_version(void);
+
+#ifdef __cplusplus
+}
+#endif

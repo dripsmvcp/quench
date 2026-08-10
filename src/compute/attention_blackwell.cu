@@ -1,0 +1,489 @@
+// =============================================================================
+// attention_blackwell.cu -- Optimized WMMA attention for sm_120 (Blackwell)
+// =============================================================================
+//
+// Flash Attention 2 kernel using WMMA tensor cores with 8 warps (256 threads),
+// double-buffered KV tiles, and adaptive Q tile height.
+//
+// Key improvements over an older 64x64 / 4-warp WMMA layout:
+//   - 8 warps: 2x WMMA parallelism, each warp handles fewer tiles
+//   - Double-buffered KV: overlaps next-K prefetch with current-tile computation
+//   - S/P union shared memory: float S and half P share the same region
+//   - Adaptive Br: 128-row Q tiles when shared memory allows (head_dim <= 64),
+//     64-row Q tiles otherwise — both with 8 warps for better utilisation
+//   - Fast math __expf: direct SFU instruction for softmax exp (~2x vs expf)
+//   - Parallel softmax: all 256 threads cooperate on row max/exp/sum/rescale
+//     (was: only Br threads active, 50-75% idle)
+//   - Fused softmax + float→half: single pass over SP_tile
+//
+// The RTX 5090 (sm_120) has 100 KB shared memory per SM with 99 KB opt-in max.
+// Layout for Br=128, Bc=64, HD=64: ~96.5 KB (fits)
+// Layout for Br=64, Bc=64, HD=128:  ~96.3 KB (fits)
+// =============================================================================
+
+#include "compute/attention_tc.h"
+#include "compute/attention_paged_common.cuh"
+#include "core/logging.h"
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <float.h>
+#include <mma.h>
+
+using namespace nvcuda;
+
+namespace quench {
+
+// Fixed tile/thread parameters
+static constexpr int BW_Bc = 64;  // key tile cols (always 64)
+static constexpr int BW_WARP_SIZE = 32;
+static constexpr int BW_NUM_WARPS = 8;
+static constexpr int BW_BLOCK_THREADS = BW_WARP_SIZE * BW_NUM_WARPS;  // 256
+
+// WMMA tile dimensions (from attention_paged_common.cuh)
+static constexpr int WMMA_M = kWmmaTileM;
+static constexpr int WMMA_N = kWmmaTileN;
+static constexpr int WMMA_K = kWmmaTileK;
+
+// ---- kernel (templated on Br) -----------------------------------------------
+
+template <int Br, int HD>
+__global__ void flash_attention_blackwell_kernel(const half* __restrict__ Q, const half* __restrict__ K,
+                                                 const half* __restrict__ V, half* __restrict__ O,
+                                                 int batch_size, int seq_q, int seq_kv, int n_heads,
+                                                 int n_kv_heads, float scale, bool causal, int sliding_window,
+                                                 float softcap, int q_offset) {
+    constexpr int head_dim = HD;  // compile-time head_dim for optimized div/mod
+
+    // Threads-per-row for parallel softmax (power of 2, fits in warp)
+    constexpr int TPR = BW_BLOCK_THREADS / Br;  // 4 (Br=64) or 2 (Br=128)
+    static_assert(TPR >= 1 && (TPR & (TPR - 1)) == 0, "TPR must be power of 2");
+
+    // ---- index computation --------------------------------------------------
+    const int tile_q = blockIdx.x;
+    const int batch_head = blockIdx.y;
+    const int batch_idx = batch_head / n_heads;
+    const int head_idx = batch_head % n_heads;
+    const int kv_head = head_idx / (n_heads / n_kv_heads);
+
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;  // [0,256)
+    const int warp_id = tid / BW_WARP_SIZE;                  // [0,8)
+    const int q_start = tile_q * Br;
+
+    // Parallel softmax: which row and lane within row
+    const int sm_row = tid / TPR;   // [0, Br)
+    const int sm_lane = tid % TPR;  // [0, TPR)
+
+    // Global memory strides (row-major [batch, seq, heads, head_dim]).
+    const int64_t q_row_stride = (int64_t)n_heads * head_dim;
+    const int64_t kv_row_stride = (int64_t)n_kv_heads * head_dim;
+
+    const half* Q_ptr = Q + (int64_t)batch_idx * seq_q * q_row_stride + (int64_t)q_start * q_row_stride +
+                        (int64_t)head_idx * head_dim;
+    const half* K_ptr = K + (int64_t)batch_idx * seq_kv * kv_row_stride + (int64_t)kv_head * head_dim;
+    const half* V_ptr = V + (int64_t)batch_idx * seq_kv * kv_row_stride + (int64_t)kv_head * head_dim;
+    half* O_ptr = O + (int64_t)batch_idx * seq_q * q_row_stride + (int64_t)q_start * q_row_stride +
+                  (int64_t)head_idx * head_dim;
+
+    // ---- shared memory layout -----------------------------------------------
+    //
+    // Q_tile      : half  [Br  × hd]
+    // KV_buf[0]   : half  [Bc  × hd]   double-buffer slot 0
+    // KV_buf[1]   : half  [Bc  × hd]   double-buffer slot 1
+    // SP_tile     : union { float [Br×Bc], half [Br×Bc] }
+    // O_acc       : float [Br  × hd]
+    // row_m       : float [Br]          running row max
+    // row_l       : float [Br]          running row sum
+    extern __shared__ char smem[];
+
+    half* Q_tile = reinterpret_cast<half*>(smem);
+    half* KV_buf0 = Q_tile + Br * head_dim;
+    half* KV_buf1 = KV_buf0 + BW_Bc * head_dim;
+    // SP_tile: union of float[Br*Bc] and half[Br*Bc]
+    float* SP_float = reinterpret_cast<float*>(KV_buf1 + BW_Bc * head_dim);
+    half* SP_half = reinterpret_cast<half*>(SP_float);
+    float* O_acc = reinterpret_cast<float*>(reinterpret_cast<char*>(SP_float) + Br * BW_Bc * sizeof(float));
+    float* row_m = reinterpret_cast<float*>(O_acc + Br * head_dim);
+    float* row_l = row_m + Br;
+
+    half* KV_bufs[2] = {KV_buf0, KV_buf1};
+
+    // ---- load Q tile --------------------------------------------------------
+    {
+        const int total = Br * head_dim;
+        for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+            int r = i / head_dim;
+            int d = i % head_dim;
+            if (q_start + r < seq_q) {
+                Q_tile[i] = Q_ptr[(int64_t)r * q_row_stride + d];
+            } else {
+                Q_tile[i] = __float2half(0.0f);
+            }
+        }
+    }
+
+    // ---- zero output accumulator + init running softmax state ---------------
+    {
+        const int total = Br * head_dim;
+        for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+            O_acc[i] = 0.0f;
+        }
+    }
+    if (tid < Br) {
+        row_m[tid] = -FLT_MAX;
+        row_l[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // ---- number of KV tiles to iterate ----
+    int num_kv_tiles, first_kv_tile;
+    compute_kv_tile_bounds(q_start, Br, BW_Bc, seq_q, seq_kv, causal, sliding_window, first_kv_tile,
+                           num_kv_tiles, q_offset);
+
+    // Derived constants for WMMA tiling
+    const int hd_chunks = head_dim / WMMA_K;
+    const int s_row_tiles = Br / WMMA_M;
+    const int s_col_tiles = BW_Bc / WMMA_N;  // 4
+    const int s_total_tiles = s_row_tiles * s_col_tiles;
+    const int o_row_tiles = Br / WMMA_M;
+    const int o_col_tiles = head_dim / WMMA_N;
+    const int o_total_tiles = o_row_tiles * o_col_tiles;
+    const int pv_chunks = BW_Bc / WMMA_K;  // 4
+
+    // ---- prefetch first K tile into buf[0] (Sawtooth: start from opposite end if reversed) ----
+    const bool sawtooth_reverse = (blockIdx.x % 2 == 1);
+    const int first_j = sawtooth_reverse ? (num_kv_tiles - 1) : first_kv_tile;
+    int cur_buf = 0;
+    if (first_kv_tile < num_kv_tiles) {
+        const int kv_start = first_j * BW_Bc;
+        const int total = BW_Bc * head_dim;
+        for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+            int r = i / head_dim;
+            int d = i % head_dim;
+            if (kv_start + r < seq_kv) {
+                KV_bufs[0][i] = K_ptr[(int64_t)(kv_start + r) * kv_row_stride + d];
+            } else {
+                KV_bufs[0][i] = __float2half(0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    // ================================================================
+    // Main loop over KV tiles (Sawtooth: alternate scan direction per Q tile for L2 locality)
+    // ================================================================
+    const int n_kv_iters = num_kv_tiles - first_kv_tile;
+    for (int iter = 0; iter < n_kv_iters; iter++) {
+        const int j = sawtooth_reverse ? (num_kv_tiles - 1 - iter) : (first_kv_tile + iter);
+        const int kv_start = j * BW_Bc;
+
+        // K[j] is in KV_bufs[cur_buf], ready.
+
+        // ============================================================
+        // Phase 1: S = Q_tile @ KV_buf[cur]^T  [Br, Bc] using WMMA
+        // ============================================================
+        for (int tile_idx = warp_id; tile_idx < s_total_tiles; tile_idx += BW_NUM_WARPS) {
+            int ri = tile_idx / s_col_tiles;
+            int ci = tile_idx % s_col_tiles;
+
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+
+            for (int k = 0; k < hd_chunks; k++) {
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                wmma::load_matrix_sync(a_frag, Q_tile + ri * WMMA_M * head_dim + k * WMMA_K, head_dim);
+
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+                wmma::load_matrix_sync(b_frag, KV_bufs[cur_buf] + ci * WMMA_N * head_dim + k * WMMA_K,
+                                       head_dim);
+
+                wmma::mma_sync(acc, a_frag, b_frag, acc);
+            }
+
+            wmma::store_matrix_sync(SP_float + ri * WMMA_M * BW_Bc + ci * WMMA_N, acc, BW_Bc,
+                                    wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // ---- Apply scale, softcap, and causal/sliding_window mask ----
+        apply_score_masks(SP_float, Br, BW_Bc, BW_BLOCK_THREADS, tid, q_start, kv_start, seq_q, seq_kv, scale,
+                          softcap, causal, sliding_window, q_offset);
+        __syncthreads();
+
+        // ============================================================
+        // Phase 2+3: Parallel online softmax + rescale O + SP→half
+        //
+        // All 256 threads participate. TPR threads per row cooperate
+        // using warp shuffle for reductions.
+        // ============================================================
+        {
+            const int r = sm_row;
+            const bool row_valid = (r < Br) && (q_start + r < seq_q);
+
+            // Step 1: Parallel row max
+            float partial_max = -FLT_MAX;
+            if (row_valid) {
+                for (int c = sm_lane; c < BW_Bc; c += TPR) {
+                    partial_max = fmaxf(partial_max, SP_float[r * BW_Bc + c]);
+                }
+            }
+// Warp shuffle XOR reduction across TPR lanes
+#pragma unroll
+            for (int offset = TPR / 2; offset >= 1; offset >>= 1) {
+                partial_max = fmaxf(partial_max, __shfl_xor_sync(0xffffffff, partial_max, offset));
+            }
+            float m_ij = partial_max;  // all TPR threads now have row max
+
+            // Step 2: New running max and correction factor
+            float m_old = row_valid ? row_m[r] : -FLT_MAX;
+            float m_new = fmaxf(m_old, m_ij);
+            float alpha = __expf(m_old - m_new);  // fast math: correction for old accumulator
+
+            // Step 3: Parallel exp + sum, and write SP_half in-place.
+            // Mask guard: fully-masked tile (Gemma-4 SWA long-seq) would give
+            // __expf(-FLT_MAX - (-FLT_MAX)) = 1, corrupting partial_sum.
+            float partial_sum = 0.0f;
+            if (row_valid) {
+                for (int c = sm_lane; c < BW_Bc; c += TPR) {
+                    float s_val = SP_float[r * BW_Bc + c];
+                    float p = (s_val <= -FLT_MAX * 0.5f) ? 0.0f : __expf(s_val - m_new);
+                    partial_sum += p;
+                    SP_float[r * BW_Bc + c] = p;  // store for half conversion below
+                }
+            }
+// Reduce sum across TPR lanes
+#pragma unroll
+            for (int offset = TPR / 2; offset >= 1; offset >>= 1) {
+                partial_sum += __shfl_xor_sync(0xffffffff, partial_sum, offset);
+            }
+
+            // Step 4: Update running state (one thread per row writes)
+            float l_old = row_valid ? row_l[r] : 0.0f;
+            float l_new = alpha * l_old + partial_sum;
+            if (sm_lane == 0 && row_valid) {
+                row_m[r] = m_new;
+                row_l[r] = l_new;
+            }
+
+            // Step 5: Rescale O_acc (all TPR threads cooperate over head_dim)
+            float rescale = (l_old > 0.0f) ? (alpha * l_old / l_new) : 0.0f;
+            if (row_valid) {
+                for (int d = sm_lane; d < head_dim; d += TPR) {
+                    O_acc[r * head_dim + d] *= rescale;
+                }
+            }
+
+            // Step 6: Convert SP_float → SP_half with 1/l_new baked in.
+            // SP_half aliases SP_float COMPACTLY: half row r lives in the
+            // bytes of float row r/2, so in-place stores clobber float scores
+            // other threads have not read yet (deterministic even intra-warp;
+            // padding rows skip Steps 1-5 and race ahead zero-filling valid
+            // rows' scores — issue). Stage this thread's halves in
+            // registers, barrier, then store.
+            constexpr int CPT = BW_Bc / TPR;  // columns per thread
+            float spv = (l_new > 0.0f) ? (1.0f / l_new) : 0.0f;
+            half hbuf[CPT];
+#pragma unroll
+            for (int i = 0; i < CPT; i++) {
+                int c = sm_lane + i * TPR;
+                hbuf[i] = __float2half(row_valid ? SP_float[r * BW_Bc + c] * spv : 0.0f);
+            }
+            __syncthreads();  // all float reads of SP_float complete before any half write
+#pragma unroll
+            for (int i = 0; i < CPT; i++)
+                SP_half[r * BW_Bc + sm_lane + i * TPR] = hbuf[i];
+        }
+        __syncthreads();
+
+        // ---- Load V tile into KV_bufs[cur_buf] (K no longer needed) ----
+        {
+            const int total = BW_Bc * head_dim;
+            for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+                int r = i / head_dim;
+                int d = i % head_dim;
+                if (kv_start + r < seq_kv) {
+                    KV_bufs[cur_buf][i] = V_ptr[(int64_t)(kv_start + r) * kv_row_stride + d];
+                } else {
+                    KV_bufs[cur_buf][i] = __float2half(0.0f);
+                }
+            }
+        }
+        __syncthreads();
+
+        // ============================================================
+        // Phase 4: O += P @ V  [Br, head_dim] using WMMA
+        // ============================================================
+        for (int tile_idx = warp_id; tile_idx < o_total_tiles; tile_idx += BW_NUM_WARPS) {
+            int ri = tile_idx / o_col_tiles;
+            int di = tile_idx % o_col_tiles;
+
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
+            wmma::load_matrix_sync(o_frag, O_acc + ri * WMMA_M * head_dim + di * WMMA_N, head_dim,
+                                   wmma::mem_row_major);
+
+            for (int k = 0; k < pv_chunks; k++) {
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> p_frag;
+                wmma::load_matrix_sync(p_frag, SP_half + ri * WMMA_M * BW_Bc + k * WMMA_K, BW_Bc);
+
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> v_frag;
+                wmma::load_matrix_sync(v_frag, KV_bufs[cur_buf] + k * WMMA_N * head_dim + di * WMMA_N,
+                                       head_dim);
+
+                wmma::mma_sync(o_frag, p_frag, v_frag, o_frag);
+            }
+
+            wmma::store_matrix_sync(O_acc + ri * WMMA_M * head_dim + di * WMMA_N, o_frag, head_dim,
+                                    wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // ---- Prefetch next K tile into KV_bufs[1-cur_buf] (Sawtooth-aware) ----
+        int next_buf = 1 - cur_buf;
+        const int next_j = sawtooth_reverse ? (j - 1) : (j + 1);
+        const bool has_next = sawtooth_reverse ? (next_j >= first_kv_tile) : (next_j < num_kv_tiles);
+        if (has_next) {
+            const int next_kv_start = next_j * BW_Bc;
+            const int total = BW_Bc * head_dim;
+            for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+                int r = i / head_dim;
+                int d = i % head_dim;
+                if (next_kv_start + r < seq_kv) {
+                    KV_bufs[next_buf][i] = K_ptr[(int64_t)(next_kv_start + r) * kv_row_stride + d];
+                } else {
+                    KV_bufs[next_buf][i] = __float2half(0.0f);
+                }
+            }
+        }
+        cur_buf = next_buf;
+        __syncthreads();
+    }
+
+    // ---- write final output to global memory ----
+    {
+        const int total = Br * head_dim;
+        for (int i = tid; i < total; i += BW_BLOCK_THREADS) {
+            int r = i / head_dim;
+            if (q_start + r < seq_q) {
+                O_ptr[(int64_t)r * q_row_stride + (i % head_dim)] = __float2half(O_acc[i]);
+            }
+        }
+    }
+}
+
+// Compute shared memory for a given Br and head_dim
+static size_t compute_smem(int Br, int head_dim) {
+    return (size_t)Br * head_dim * sizeof(half)           // Q_tile
+           + 2 * (size_t)BW_Bc * head_dim * sizeof(half)  // KV_buf[0] + KV_buf[1]
+           + (size_t)Br * BW_Bc * sizeof(float)           // SP_tile (float union)
+           + (size_t)Br * head_dim * sizeof(float)        // O_acc
+           + 2 * (size_t)Br * sizeof(float);              // row_m + row_l
+}
+
+// ===== Host-side launcher ====================================================
+
+bool flash_attention_blackwell(const Tensor& Q, const Tensor& K, const Tensor& V, Tensor& O, float scale,
+                               bool causal, int sliding_window, float softcap, cudaStream_t stream,
+                               int q_offset) {
+    const int batch_size = static_cast<int>(Q.shape[0]);
+    const int seq_q = static_cast<int>(Q.shape[1]);
+    const int n_heads = static_cast<int>(Q.shape[2]);
+    const int head_dim = static_cast<int>(Q.shape[3]);
+    const int seq_kv = static_cast<int>(K.shape[1]);
+    const int n_kv_heads = static_cast<int>(K.shape[2]);
+
+    // Query device shared memory limit
+    int device = 0;
+    cudaGetDevice(&device);
+    int max_smem = 0;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+
+    // Choose Br: prefer 128 if shared memory fits, else 64
+    const size_t smem_128 = compute_smem(128, head_dim);
+    const size_t smem_64 = compute_smem(64, head_dim);
+    const bool use_br128 = (smem_128 <= (size_t)max_smem);
+
+// Dispatch macro: Br x HD template instantiation
+#define LAUNCH_BW(BR, HD)                                                                                 \
+    do {                                                                                                  \
+        cudaFuncSetAttribute(flash_attention_blackwell_kernel<BR, HD>,                                    \
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));        \
+        flash_attention_blackwell_kernel<BR, HD>                                                          \
+            <<<grid, block, smem, stream>>>(reinterpret_cast<const half*>(Q.data),                        \
+                                            reinterpret_cast<const half*>(K.data),                        \
+                                            reinterpret_cast<const half*>(V.data),                        \
+                                            reinterpret_cast<half*>(O.data), batch_size, seq_q, seq_kv,   \
+                                            n_heads, n_kv_heads, scale, causal, sliding_window, softcap,  \
+                                            q_offset);                                                    \
+        QUENCH_CUDA_CHECK_LAUNCH();                                                                          \
+    } while (0)
+
+    // Select Br and compute grid
+    auto launch = [&](int Br, size_t smem) -> bool {
+        const int num_q_tiles = (seq_q + Br - 1) / Br;
+        dim3 grid(num_q_tiles, batch_size * n_heads);
+        dim3 block(BW_WARP_SIZE, BW_NUM_WARPS);
+
+        bool launched = false;
+        if (Br == 128) {
+            switch (head_dim) {
+                case 64:
+                    LAUNCH_BW(128, 64);
+                    launched = true;
+                    break;
+                case 96:
+                    LAUNCH_BW(128, 96);
+                    launched = true;
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            switch (head_dim) {
+                case 64:
+                    LAUNCH_BW(64, 64);
+                    launched = true;
+                    break;
+                case 96:
+                    LAUNCH_BW(64, 96);
+                    launched = true;
+                    break;
+                case 128:
+                    LAUNCH_BW(64, 128);
+                    launched = true;
+                    break;
+                case 256:
+                    LAUNCH_BW(64, 256);
+                    launched = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        return launched;
+    };
+
+    bool launched = false;
+    if (use_br128) {
+        launched = launch(128, smem_128);
+    } else if (smem_64 <= (size_t)max_smem) {
+        launched = launch(64, smem_64);
+    }
+    // Unsupported head_dim or smem too small (e.g. hd=256: Br=64 needs ~176 KB
+    // vs the 99 KB sm_120 opt-in) → DECLINE so the dispatcher can fail loudly.
+    // The old silent fallback to a generic WMMA prefill kernel (since removed)
+    // was the bug: that kernel also exceeded smem at hd=256, nobody checked
+    // the launch error, and O kept garbage (teacher-forced PPL ~1e10) — and it
+    // had no q_offset, so chunked continuations would mask wrongly even when it
+    // ran.
+    if (launched) {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            QUENCH_LOG_ERROR("flash_attention_blackwell launch failed (hd=%d): %s", head_dim,
+                          cudaGetErrorString(err));
+            return false;
+        }
+    }
+    return launched;
+#undef LAUNCH_BW
+}
+
+}  // namespace quench
