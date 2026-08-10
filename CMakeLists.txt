@@ -703,6 +703,13 @@ if(QUENCH_BUILD_TESTS)
     set_tests_properties(unit_core unit_text unit_e2e_subset guard_e2e_lane_split
         PROPERTIES LABELS "unit")
 
+    # PR eval verdict policy (scripts/eval_scorer.py via scripts/pr_eval_bot.py):
+    # pure Python, stdlib-only, GPU-free. In the unit lane so a policy change
+    # cannot land without its tests running.
+    add_test(NAME unit_eval_policy
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/eval/test_pr_eval_bot.py)
+    set_tests_properties(unit_eval_policy PROPERTIES LABELS "unit")
+
     add_test(NAME gpu_compute   COMMAND test-compute)
     add_test(NAME gpu_attention COMMAND test-attention)
     add_test(NAME gpu_quant     COMMAND test-quant)

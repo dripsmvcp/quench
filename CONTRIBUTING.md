@@ -102,6 +102,19 @@ Body explains *why*, not *what* — the diff already says what changed.
 - Don't reintroduce SM 8.0 / 9.0 / 10.0 code paths. They were removed deliberately and the build pins `arch=compute_120a,code=sm_120a` (see `QUENCH_SM120_FLAGS` in CMakeLists.txt).
 - Don't break the C API. If a public function in `include/quench/` needs to change, update every caller and call it out in the PR.
 
+## What happens to your PR
+
+Perf-sensitive PRs are evaluated by an automated pipeline (`scripts/pr_eval_bot.py`) whose design goal is that **the published verdict is exactly what the committed policy computes from the recorded measurements** — nobody, the maintainer's laptop included, can quietly alter it. Opt in by ticking a `- [x] ... RTX 5090 ...` line in the PR body (or the maintainer applies the `eval` label).
+
+What it does, mechanically:
+
+- **Same-session A/B.** Your merged tree and `main` are both built from source on a rented RTX 5090 and benched in one box session (`quench-cli --bench`, median of alternated reps). The verdict gates on decode throughput (`tg`) only — prefill varies up to 2.6× with cuBLAS algorithm selection — with a ±2% noise bar. Verdict ladder: suite failure → `eval:reject`; any gated regression beyond the bar → `eval:reject` (a regression outranks any improvement); gain beyond the bar → `eval:pass`; otherwise `eval:noise`.
+- **Your PR does not grade itself.** `bench/` and `tests/` are overlaid from the base commit before your tree reaches the runner: your engine code is measured by main's bench and gated by main's tests against main's oracles. A PR that *modifies* pinned harness files (or the eval scripts, or workflows) still gets measured, but its best verdict is `eval:tainted` — the harness diff needs human review. Files *added* under pinned paths don't taint, but they also don't run during the eval; they join the gate once merged. Because the suite is compiled by your tree's CMakeLists, the pipeline also asserts your build's `ctest -N` list is a superset of main's.
+- **The verdict is attested.** The scorer (`scripts/eval_scorer.py`, a pure stdlib program) re-derives the verdict from the canonical evidence bundle inside a polaris.computer Intel TDX machine with egress sealed; the DCAP receipt binds scorer + bundle + verdict. Local and TEE verdicts must agree byte-for-byte. Anyone can re-check a published verdict offline from a clean clone: `python3 scripts/verify_receipt.py receipt.json bundle.json` (both stored verbatim in the PR's git note — `git fetch origin +refs/notes/quench-eval:refs/notes/quench-eval`).
+- **The verdict is enforced.** It lands as the `quench/eval` commit status on your head sha (required by branch protection), an `eval:*` label, a PR comment with the measured table, and the git note. A new push resets the status and re-queues evaluation. The bot never merges.
+
+Residual risk, stated honestly: the *measurement* itself runs outside any TEE (consumer GPUs have no confidential-compute mode), and PR code runs as root on the runner during build/bench — the integrity checks (per-eval tree wipe, main built before any PR code executes, hash-locked baseline build, checksum re-push before every baseline rep, GPU-idle assertion, model-file hash) turn a silent cheat into overt sabotage code that has to survive human review of your diff, not into an impossibility.
+
 ## Filing bugs
 
 Useful bug reports include:
