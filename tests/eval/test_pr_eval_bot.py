@@ -756,6 +756,64 @@ class PrInfoFields(unittest.TestCase):
         self.assertIn('info["authorAssociation"]', self.body)
 
 
+class CodeownersMirrorsTaint(unittest.TestCase):
+    """CODEOWNERS and the scorer's taint set are two expressions of one policy:
+    "this diff needs human eyes". They must not drift.
+
+    They are not redundant. The taint cap only applies if an eval RAN — a PR
+    touching only cmake/ or Dockerfile is non-runtime, so no eval is
+    triggered and the taint policy never gets a say. And the bot can be down
+    (a bad gh field killed every poll; a spot GPU can vanish for hours).
+    CODEOWNERS is enforced by GitHub and holds in both cases.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rules = []
+        for line in (_ROOT / ".github/CODEOWNERS").read_text().split("\n"):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                cls.rules.append(line.split()[0])
+
+    def covered(self, path: str) -> bool:
+        """Does some CODEOWNERS rule match this path? Rules here are all
+        rooted (`/x`) — a directory rule covers everything beneath it."""
+        for rule in self.rules:
+            r = rule.lstrip("/").rstrip("/")
+            if path == r or path.startswith(r + "/"):
+                return True
+        return False
+
+    def test_every_tainting_file_has_an_owner(self):
+        for path in bot.scorer.INFRA_FILES + bot.scorer.SUPPLY_CHAIN_FILES:
+            with self.subTest(path=path):
+                self.assertTrue(self.covered(path),
+                                f"{path} taints but has no CODEOWNERS entry")
+
+    def test_every_tainting_directory_has_an_owner(self):
+        prefixes = (bot.scorer.INFRA_PREFIXES + bot.scorer.SUPPLY_CHAIN_PREFIXES
+                    + tuple(d + "/" for d in bot.scorer.PINNED_DIRS))
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                self.assertTrue(self.covered(prefix.rstrip("/") + "/probe"),
+                                f"{prefix} taints but has no CODEOWNERS entry")
+
+    def test_codeowners_governs_itself(self):
+        # otherwise the first unreviewed PR can delete every other rule
+        self.assertTrue(self.covered(".github/CODEOWNERS"))
+
+    def test_every_rule_names_an_owner(self):
+        text = (_ROOT / ".github/CODEOWNERS").read_text()
+        for line in text.split("\n"):
+            line = line.split("#", 1)[0].strip()
+            if line:
+                with self.subTest(line=line):
+                    # a pattern with no owner SILENTLY REMOVES ownership
+                    self.assertGreater(len(line.split()), 1, line)
+                    self.assertTrue(all(o.startswith("@") for o in line.split()[1:]),
+                                    line)
+
+
 class CronWrapper(unittest.TestCase):
     """The cron wrapper decides WHICH tree grades other people's PRs, and its
     own install snippet is the documentation people paste. Both were wrong."""

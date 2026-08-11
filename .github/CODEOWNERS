@@ -1,0 +1,46 @@
+# Paths whose diff needs human eyes, regardless of what the measurement says.
+#
+# This file mirrors the eval scorer's taint set (scripts/eval_scorer.py:
+# INFRA_FILES, INFRA_PREFIXES, SUPPLY_CHAIN_FILES, SUPPLY_CHAIN_PREFIXES,
+# PINNED_DIRS). Both express the same policy — "the pipeline cannot vouch for
+# this on its own" — so they are kept in sync by a test
+# (tests/eval/test_pr_eval_bot.py, CodeownersMirrorsTaint). Add a path to the
+# taint set and this file must grow an entry too, or that test fails.
+#
+# Why both, when the taint set already caps such a PR at eval:tainted:
+#
+#   * The taint cap only exists if an eval RAN. A PR touching only cmake/ or
+#     Dockerfile is not a runtime path, so no eval is triggered, no eval:*
+#     label is applied, and the taint policy never gets a say.
+#   * The bot can be down. It has been: a bad gh field killed every poll, and
+#     a rented spot GPU can be unavailable for hours. A guard that depends on
+#     the bot running is not a guard against the bot being broken.
+#
+# CODEOWNERS is enforced by GitHub itself and holds in both cases.
+#
+# NOTE: on its own this file only REQUESTS review. It blocks nothing until
+# branch protection on main sets required_pull_request_reviews with
+# require_code_owner_reviews = true. See CONTRIBUTING.md.
+
+# --- eval infrastructure: the bot, the policy it applies, how it is run -----
+/scripts/pr_eval_bot.py         @dripsmvcp
+/scripts/eval_scorer.py         @dripsmvcp
+/scripts/pr_eval_cron.sh        @dripsmvcp
+/scripts/provision_eval_box.sh  @dripsmvcp
+# The offline verifier. Not in the scorer's taint set (it runs on a reader's
+# machine, never in the eval), but a weakened verifier makes a published
+# receipt say more than it proves.
+/scripts/verify_receipt.py      @dripsmvcp
+
+# --- CI, the merge gate, and this file itself -------------------------------
+/.github/                       @dripsmvcp
+
+# --- the pinned harness: what the verdict is measured BY --------------------
+/bench/                         @dripsmvcp
+/tests/                         @dripsmvcp
+
+# --- supply chain: what the build pulls in, how the container starts --------
+/cmake/                         @dripsmvcp
+/Dockerfile                     @dripsmvcp
+/docker-entrypoint.sh           @dripsmvcp
+/docker-compose.yml             @dripsmvcp
