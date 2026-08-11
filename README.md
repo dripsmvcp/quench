@@ -20,12 +20,20 @@ First comparative measurement — Mistral-Nemo-12B-Instruct, batch 1,
 synthetic pp512/tg128, 3-rep averages, each run verified exclusive on the
 GPU (llama-bench methodology across all three engines):
 
+Percentages are against llama.cpp on the identical GGUF file.
+
 | Engine | Weights | Prefill pp512 | Decode tg128 |
 |---|---|---:|---:|
-| **quench** (default: n-gram speculator on) | Q8_0 GGUF → NVFP4 decode cache | 9,315 tok/s | **226.6 tok/s** |
-| **quench** (`--set speculative.ngram=false`) | Q8_0 GGUF → NVFP4 decode cache | 9,553 tok/s | **188.5 tok/s** |
-| llama.cpp (master `030ebb5`, `-fa 1`) | Q8_0 GGUF (same file) | 9,942 ± 1,133 tok/s | 118.2 ± 0.2 tok/s |
-| vLLM 0.27.0 (FLASH_ATTN backend) | BF16 safetensors | ~8,438 tok/s | ~65.5 tok/s |
+| **quench** (default: n-gram speculator on) | Q8_0 GGUF → NVFP4 decode cache | 9,315 tok/s (−6%) | **226.6 tok/s (+92%)** |
+| **quench** (`--set speculative.ngram=false`) | Q8_0 GGUF → NVFP4 decode cache | 9,553 tok/s (−4%) | **188.5 tok/s (+59%)** |
+| llama.cpp (master `030ebb5`, `-fa 1`) | Q8_0 GGUF (same file) | 9,942 ± 1,133 tok/s (baseline) | 118.2 ± 0.2 tok/s (baseline) |
+| vLLM 0.27.0 (FLASH_ATTN backend) | BF16 safetensors | ~8,438 tok/s (−15%) | ~65.5 tok/s (−45%) |
+
+**+59% decode on the same file — and −4% prefill.** quench is faster where it
+was built to be (decode, the bandwidth-bound path an NVFP4 cache attacks) and
+marginally slower at prefill, which is compute-bound and where llama.cpp's
+cuBLAS path is already well tuned. Prefill here also carries ±11% run-to-run
+variance, so treat that 4% as a tie rather than a loss.
 
 Measured 2026-08-11 on an RTX 5090 (32 GB, vast.ai), quench commit `4e958fd`
 built with CUDA 13.3:
@@ -43,12 +51,18 @@ VLLM_ATTENTION_BACKEND=FLASH_ATTN VLLM_USE_FLASHINFER_SAMPLER=0 \
   --num-iters 3 --num-iters-warmup 1 --max-model-len 2048
 ```
 
-Read it honestly. The like-for-like comparison is quench vs. llama.cpp on
-the identical GGUF file: **1.6× decode** (188.5 vs. 118.2 tok/s), or 1.9×
-with the n-gram speculator, which is on by default and token-identical to
-greedy but benefits from the unusually draftable synthetic bench output.
-vLLM has no usable Q8_0 GGUF path on `sm_120`, so it ran BF16; that
-comparison is as much about weight format as about engine.
+Read it honestly. Only the llama.cpp row is like-for-like — same GGUF file,
+same harness. Two caveats on the other numbers:
+
+- The **+92%** row has the n-gram speculator on. It is the default and is
+  token-identical to greedy, but synthetic bench output is unusually
+  draftable, so that figure will not hold on real prompts. **+59% is the
+  number to quote.**
+- **vLLM is not a like-for-like comparison** and is shown for context only. It
+  has no usable Q8_0 GGUF path on `sm_120`, so it ran BF16 — a different
+  weight format — and batch 1 on one consumer card is the regime it is least
+  suited to. Its strength is throughput under concurrency, which this
+  benchmark does not measure.
 
 Most of the gap is bytes moved per token, which is the point of the NVFP4
 decode cache — but the speedups are *smaller* than the byte reductions:
