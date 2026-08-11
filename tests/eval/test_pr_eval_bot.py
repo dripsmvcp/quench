@@ -245,8 +245,12 @@ class Taint(unittest.TestCase):
         self.assertEqual(u, [])
 
     def test_supply_chain_prefix_is_a_directory_not_a_substring(self):
+        # `cmake/` is a directory prefix, `Dockerfile` an exact path — neither
+        # matches by substring. (Keep these fixtures out of docs/:
+        # scripts/check-release.sh treats any docs/ string in tracked code as
+        # a doc pointer and fails the build when it does not resolve.)
         t, u = bot.classify_taint([("M", "cmakelists_notes.md"),
-                                   ("M", "docs/Dockerfile.md")])
+                                   ("M", "tools/Dockerfile.template")])
         self.assertEqual((t, u), ([], []))
 
     def test_root_cmakelists_still_does_not_taint(self):
