@@ -16,26 +16,50 @@ For GGUF models, quench builds an **NVFP4 decode cache** that converts Q8_0 weig
 
 ## Performance
 
-First measured numbers — a single-run CLI measurement on real hardware, not a
-tuned or comparative benchmark:
+First comparative measurement — Mistral-Nemo-12B-Instruct, batch 1,
+synthetic pp512/tg128, 3-rep averages, each run verified exclusive on the
+GPU (llama-bench methodology across all three engines):
 
-| Model | Quant | Decode | Prefill |
-|---|---|---|---|
-| Mistral-Nemo-12B-Instruct | Q8_0 | ~185 tok/s | ~460–750 tok/s |
+| Engine | Weights | Prefill pp512 | Decode tg128 |
+|---|---|---:|---:|
+| **quench** (default: n-gram speculator on) | Q8_0 GGUF → NVFP4 decode cache | 9,315 tok/s | **226.6 tok/s** |
+| **quench** (`--set speculative.ngram=false`) | Q8_0 GGUF → NVFP4 decode cache | 9,553 tok/s | **188.5 tok/s** |
+| llama.cpp (master `030ebb5`, `-fa 1`) | Q8_0 GGUF (same file) | 9,942 ± 1,133 tok/s | 118.2 ± 0.2 tok/s |
+| vLLM 0.27.0 (FLASH_ATTN backend) | BF16 safetensors | ~8,438 tok/s | ~65.5 tok/s |
 
-Measured 2026-08-11 on an RTX 5090 (32 GB), CUDA 13.3, commit `17ffb15`,
-default configuration:
+Measured 2026-08-11 on an RTX 5090 (32 GB, vast.ai), quench commit `4e958fd`
+built with CUDA 13.3:
 
 ```bash
+# quench (add --set speculative.ngram=false for the pure-decode row)
 quench-cli --model models/Mistral-Nemo-Instruct-2407-Q8_0.gguf \
-  --prompt "Explain in two sentences why the sky is blue."
+  --bench --bench-pp 512 --max-tokens 128 --bench-reps 3
+# llama.cpp
+llama-bench -m Mistral-Nemo-Instruct-2407-Q8_0.gguf -p 512 -n 128 -r 3 -fa 1
+# vLLM (CUDA 13.0 torch; decode derived as 127/(t_out128 - t_out1))
+VLLM_ATTENTION_BACKEND=FLASH_ATTN VLLM_USE_FLASHINFER_SAMPLER=0 \
+  vllm bench latency --model unsloth/Mistral-Nemo-Instruct-2407 \
+  --dtype bfloat16 --batch-size 1 --input-len 512 --output-len 128 \
+  --num-iters 3 --num-iters-warmup 1 --max-model-len 2048
 ```
 
+Read it honestly. The like-for-like comparison is quench vs. llama.cpp on
+the identical GGUF file: **1.6× decode** (188.5 vs. 118.2 tok/s), or 1.9×
+with the n-gram speculator, which is on by default and token-identical to
+greedy but benefits from the unusually draftable synthetic bench output.
+vLLM has no usable Q8_0 GGUF path on `sm_120`, so it ran BF16; that
+comparison is as much about weight format as about engine.
+
+Most of the gap is bytes moved per token, which is the point of the NVFP4
+decode cache — but the speedups are *smaller* than the byte reductions:
+quench's decode overlay measures 5,850 MiB against llama.cpp's 12.12 GiB
+Q8_0 and vLLM's 24.5 GB BF16, i.e. 2.1× and 4.0× fewer bytes for 1.6× and
+2.9× the throughput. quench is the fastest of the three here and also the
+furthest from its own roofline, so there is decode headroom left.
+
 Decode is the reliable signal; prefill varies with cuBLAS autotuning across
-container restarts (see Known limitations). No comparative numbers against
-llama.cpp or vLLM are published yet — those require a proper benchmark
-harness (see the [roadmap](docs/roadmap.md)) and will land here with the same
-level of detail.
+container restarts (see Known limitations). This is one model on one card at
+batch 1 — a reproducible harness is on the [roadmap](docs/roadmap.md).
 
 ## Should I use this?
 
@@ -50,7 +74,7 @@ level of detail.
 - **Single GPU only.** No tensor parallelism, no multi-GPU.
 - **Consumer Blackwell only.** `sm_120a` SASS + `compute_120f` PTX fallback. Only the 32 GB RTX 5090 is tested. No Hopper, Ada, Ampere, datacenter Blackwell. No AMD, Intel, Apple, or CPU paths.
 - **Dense llama-family GGUF only.** No MoE, no state-space/hybrid architectures, no vision, no SafeTensors loading. A checkpoint outside the supported list may load but is not verified.
-- **Minimal benchmarking.** One single-run measurement is published (see Performance); no comparative benchmarks against other engines yet.
+- **Minimal benchmarking.** One comparative measurement is published (see Performance) — single model, single GPU, batch 1, no reproducible harness yet.
 - **Prefill timing is noisy.** cuBLAS autotuning causes substantial variance across container restarts, so prefill is a weak A/B signal; decode is the reliable one.
 - **Single-user / agentic scope.** Built and tuned for single-user and moderate-concurrency inference on a 5090, not datacenter serving.
 
