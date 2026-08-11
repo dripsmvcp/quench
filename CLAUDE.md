@@ -56,9 +56,8 @@ make verify-fast # ~90 s pre-push gate make verify # ~5 min full
 - **The CHANGELOG is a changelog, not a journal.** One to three lines per entry:
   what changed for the reader, plus the number that makes it checkable. The
   investigation goes to `docs/` and the entry links there.
-- **English only in the repo.** PRs, commits, comments, docs, `.md` files. (Chat
-  replies to the user stay German — this covers artifacts that land in the repo
-  or on GitHub.)
+- **English everywhere.** PRs, commits, comments, docs, `.md` files — and chat
+  replies to the user.
 - **Always branch off `main` and `gh pr create --base main`.** Never stack PRs
   (squash-merge makes stacked PRs unrecoverable). Prefer fewer, batched PRs.
 - Runtime config is `RuntimeConfig` in `src/runtime/config.h` (`quench.conf` +

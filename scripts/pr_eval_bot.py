@@ -9,10 +9,11 @@ as a PR comment, applies an eval:* label, and stops the box. Ported from
 braid's pr_eval_bot (see that file's history for the design rationale), with
 quench's compiled-engine reality built in:
 
-  * Same-session A/B, arms alternated per rep, median of --reps. The ~2% rule
-    (cross-session deltas under ~2% are not attributable to code on this box)
-    is satisfied by construction: both arms run in one session, and the
-    verdict bar is that same 2%.
+  * Same-session A/B, arms alternated per rep, median of --reps. The noise
+    rule (deltas under the bar are not attributable to code on this box) is
+    satisfied by construction: both arms run in one session, and the verdict
+    bar is that same figure. The bar itself lives in one place,
+    scorer.NOISE_PCT — currently 1.5%.
   * The measured figure is `quench-cli --bench` decode throughput ("tg",
     batch 1, greedy, ignore-EOS) via the pinned bench/decode_speed.py.
     Prefill ("pp") is recorded but does not gate: cuBLAS algorithm selection
@@ -98,8 +99,19 @@ measurement:
     (scripts/provision_eval_box.sh) — CUDA 13.3 nvcc, CMake >= 3.25, GCC 12+,
     Ninja; it persists on the instance disk across stop/start.
 
-Never merges. The verdict is a label and a comment; merging is the
-maintainer's.
+Never merges — but the verdict now decides merges. The bot only ever writes a
+label, a comment, a commit status and a git note; it calls no merge API. What
+changed is downstream: `quench/eval` is a required status check on main, and
+.github/workflows/auto-merge.yml arms GitHub's squash auto-merge when the bot
+applies eval:pass or eval:noise. GitHub performs the merge, and only once every
+required check is green. Consequences to keep in mind when editing this file:
+
+  * eval:pass and eval:noise are unattended-merge verdicts. eval:tainted,
+    eval:reject and eval:error are `failure`/`error` and hold the PR.
+  * A non-runtime PR gets a `success` status with no eval:* label ("eval not
+    required"). That is deliberately NOT enough to arm auto-merge — the
+    workflow keys on the label, so a green-because-not-applicable status
+    cannot merge a stranger's docs or packaging PR unreviewed.
 
 Usage:
   python3 scripts/pr_eval_bot.py              # poll: eval all eligible heads
@@ -160,12 +172,19 @@ SCORER_WORKLOAD = "python3 /in/eval_scorer.py /in/bundle.json"
 NOTES_REF = "quench-eval"                 # refs/notes/quench-eval
 LEDGER = os.path.expanduser("~/quench-pr-eval-ledger.jsonl")
 EVAL_LABELS = {
-    "eval:pass": ("0E8A16", "measured decode speedup beyond the 2% bar"),
-    "eval:noise": ("FBCA04", "measured delta within the 2% noise bar"),
-    "eval:tainted": ("5319E7", "measured speedup, but the PR touches harness files"),
-    "eval:reject": ("B60205", "suite failed or measured regression beyond 2%"),
+    "eval:pass": ("0E8A16", f"measured decode speedup beyond the {NOISE_PCT}% bar"),
+    "eval:noise": ("FBCA04", f"measured delta within the {NOISE_PCT}% noise bar"),
+    "eval:tainted": ("5319E7",
+                     "no regression, but the PR touches harness or supply-chain files"),
+    "eval:reject": ("B60205",
+                    f"suite failed or measured regression beyond {NOISE_PCT}%"),
     "eval:error": ("D93F0B", "evaluation could not complete"),
 }
+# The two verdicts that arm auto-merge (see .github/workflows/auto-merge.yml).
+# Kept next to STATUS_STATE so the two can never drift: a label listed here
+# MUST map to a `success` status, or the workflow would arm a merge that the
+# required check then blocks forever.
+AUTO_MERGE_LABELS = ("eval:pass", "eval:noise")
 STATUS_STATE = {                          # eval label -> commit-status state
     "eval:pass": "success",
     "eval:noise": "success",
@@ -738,8 +757,9 @@ def evaluate(box: Box, pr: int, info: dict, args, model_sha: str) -> None:
         for w in WORKLOADS) if deltas else ""
     suite_note = "suite passed" if tests_ok else f"suite FAILED — tail:\n```\n{tail}\n```"
     taint_note = (
-        "\n> **Harness files modified by this PR** (the eval used the pinned base "
-        "versions; review these by hand before merging):\n"
+        "\n> **Harness or supply-chain files modified by this PR** (harness files "
+        "were measured from the pinned base versions; supply-chain files are not "
+        "measured at all). Auto-merge is held until these are reviewed by hand:\n"
         + "".join(f"> - `{p}`\n" for p in tainted) if tainted else "")
     unex_note = (
         "\n> New files under pinned paths — cannot weaken the gate, but they did "
@@ -754,7 +774,7 @@ def evaluate(box: Box, pr: int, info: dict, args, model_sha: str) -> None:
         f"`quench-cli --bench` pp={args.pp} tg={args.tg} batch 1, model "
         f"`{os.path.basename(BENCH_MODEL)}`. Every number below is **measured**; "
         f"the verdict gates on `tg` only (prefill varies with cuBLAS algorithm "
-        f"selection) and the bar is the same-session ±{NOISE_PCT:.0f}% rule.\n\n"
+        f"selection) and the bar is the same-session ±{NOISE_PCT:.1f}% rule.\n\n"
         f"Harness pinned to base `{base_sha[:9]}`: `bench/` and `tests/` were "
         f"overlaid from main before the PR tree reached the box — the PR's engine "
         f"is measured by main's bench and gated by main's tests against main's "
@@ -776,8 +796,11 @@ def evaluate(box: Box, pr: int, info: dict, args, model_sha: str) -> None:
         + ("| workload | main tok/s | PR tok/s | delta |\n|--:|--:|--:|--:|\n"
            + rows + "\n\n" if rows else "")
         + f"**Verdict:** {reason}. {suite_note}\n\n"
-        f"<sub>Automated eval (scripts/pr_eval_bot.py). It never merges; a new push "
-        f"re-queues evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit "
+        + (f"This verdict arms squash auto-merge; GitHub merges once every required "
+           f"check is green.\n\n" if label in AUTO_MERGE_LABELS else
+           f"This verdict holds the PR: `{label}` is not an auto-merge verdict.\n\n")
+        + f"<sub>Automated eval (scripts/pr_eval_bot.py). It calls no merge API; a new "
+        f"push re-queues evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit "
         f"status on `{head[:9]}` and as a git note under `refs/notes/{NOTES_REF}`. "
         f"Box stopped after the run.</sub>"
     )

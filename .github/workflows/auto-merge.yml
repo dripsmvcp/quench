@@ -1,21 +1,52 @@
-name: Auto-merge own PRs
+name: Auto-merge
 
-# Enables auto-merge (squash) automatically on PRs opened by the repo owner.
-# GitHub then merges the PR as soon as required checks pass and the branch
-# is mergeable. Saves the manual "Enable auto-merge" click on every PR.
+# Arms GitHub's squash auto-merge. GitHub performs the merge itself, and only
+# once every check required by main's branch protection is green — including
+# `quench/eval`, the measured verdict from scripts/pr_eval_bot.py. Nothing here
+# merges anything directly; arming a PR whose checks never go green is inert.
 #
-# Scope:
-# - Only PRs authored by the repo owner; community PRs still need manual review.
-# - Skips drafts; transitions to ready_for_review re-fire and enable auto-merge.
-# - Squash mode (matches the repo default visible in `viewerDefaultMergeMethod`).
+# Two ways in, because the verdict does not exist when the PR is opened:
+#
+#   owner   — the repo owner's PRs are armed the moment they open. They still
+#             wait for every required check; this only saves the manual
+#             "Enable auto-merge" click. Docs-only owner PRs merge on CI alone,
+#             which is the point: they get `quench/eval` = success with the
+#             description "eval not required" and never see the GPU.
+#
+#   verdict — anyone else's PRs are armed when the eval bot applies eval:pass
+#             or eval:noise, ~30 min after the push, once the RTX 5090 has
+#             actually measured the merged tree. Keying on the LABEL rather
+#             than the status is deliberate: a non-runtime PR also carries a
+#             green `quench/eval` ("eval not required"), and a green-because-
+#             not-applicable status must not merge a stranger's packaging or
+#             docs change unreviewed. No label, no arming.
+#
+# Verdicts that are NOT armed: eval:tainted (the PR touches the harness, the
+# eval infrastructure, or the supply-chain paths — cmake/, Dockerfile,
+# docker-entrypoint.sh, docker-compose.yml), eval:reject, eval:error. Those map
+# to a failure/error status, so branch protection blocks them regardless; the
+# label gate is the second, independent lock.
+#
+# Security note on `pull_request_target`: it is required here because the
+# `labeled` event on a fork PR carries no write token under `pull_request`.
+# That trigger runs the workflow file from main with a privileged token, so it
+# MUST NOT check out or execute PR code — and it does not. The only PR-derived
+# value used is the URL, and the label, which only a user with write access can
+# apply. Do not add a checkout step to this file.
 
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
 
 jobs:
-  enable-auto-merge:
+  owner:
+    name: Arm auto-merge (owner)
     if: >-
+      github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.user.login == github.repository_owner
     runs-on: ubuntu-24.04
@@ -28,3 +59,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr merge --auto --squash "$PR_URL"
+
+  verdict:
+    name: Arm auto-merge (measured verdict)
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.state == 'open' &&
+      (github.event.label.name == 'eval:pass' ||
+       github.event.label.name == 'eval:noise')
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Enable squash auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          echo "Measured verdict $LABEL — arming squash auto-merge."
+          echo "GitHub merges when the required checks (incl. quench/eval) are green."
+          gh pr merge --auto --squash "$PR_URL"
