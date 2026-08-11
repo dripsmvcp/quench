@@ -16,6 +16,20 @@ entry: what changed for the reader, plus the number that makes it checkable.
   Design: `scripts/pr_eval_bot.py` docstring; offline check:
   `scripts/verify_receipt.py`; contributor contract: CONTRIBUTING.md
   ("What happens to your PR").
+- fix(eval): the model-integrity check was a no-op. `file_hash` ran
+  `sha256sum X | cut -f1`, so the remote shell reported *cut's* status — a
+  missing or unreadable model returned rc=0 and an empty digest, and the
+  before/after comparison then asked `"" != ""` and passed. Verified against a
+  box with no model staged. Now unpiped, with a 64-hex-char shape check.
+- feat(eval): PRs from known contributors are evaluated with no human in the
+  loop; the 5090 opt-in tick is now needed only on a first PR (a spend guard —
+  the bot is cron, not a workflow, so GitHub's first-time-contributor approval
+  never applied to it). The PR template now offers that tick, which it never
+  did, so the opt-in was previously unreachable.
+- fix(eval): `pr_eval_cron.sh`'s own install snippet pointed at a different
+  repo's path and filtered on the bare basename, so running it re-installed
+  that repo's cron line and never quench's. No quench PR was ever evaluated on
+  a schedule.
 - feat(eval): the measured verdict now decides the merge. `eval:pass` and
   `eval:noise` arm GitHub squash auto-merge for any author; the bar moves
   2.0% → 1.5% (`scorer.NOISE_PCT`, bidirectional — it is the reject bar too).

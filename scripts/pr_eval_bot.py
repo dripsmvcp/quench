@@ -164,6 +164,14 @@ WORKLOADS = ("pp", "tg")                  # measured; the verdict gates on score
 RUNTIME_PREFIXES = ("src/", "include/", "tools/", "tests/", "bench/",
                     "cmake/", "CMakeLists.txt", "Dockerfile")
 NON_RUNTIME_REASON = "no engine, bench, or tests paths"
+NEEDS_OPT_IN_REASON = ("first-time contributor: needs the 5090 tick in the PR body, "
+                       "or the `eval` label")
+# Author associations whose runtime PRs are evaluated with no human in the
+# loop. GitHub's own Actions policy holds workflow runs for anyone outside
+# this set (`first_time_contributors`); the bot draws the same line for the
+# same reason, so a stranger cannot start a rented GPU by opening a PR.
+# CONTRIBUTOR means GitHub has already seen a merged commit from them here.
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
 STATUS_CONTEXT = "quench/eval"
 POLARIS_ATTEST_URL = os.environ.get("QUENCH_POLARIS_ATTEST_URL",
                                     "https://polaris.computer/v1/attest")
@@ -212,6 +220,13 @@ def ticked_5090(body: str | None) -> bool:
 
 def touches_runtime(paths: list[str]) -> bool:
     return any(p.startswith(RUNTIME_PREFIXES) for p in paths)
+
+
+def known_contributor(association: str | None) -> bool:
+    """Has GitHub already seen this author land work here? Unknown or absent
+    associations are treated as first-time — the safe direction, since the
+    cost of being wrong is a rented GPU."""
+    return (association or "").strip().upper() in TRUSTED_ASSOCIATIONS
 
 
 def overlay_harness(pr_dir: str, base_dir: str, dirs: tuple[str, ...] = PINNED_DIRS) -> None:
@@ -447,11 +462,26 @@ class Box:
         return r.stdout.decode().strip().splitlines()[-1]
 
     def file_hash(self, path: str) -> str:
-        """sha256 of one file (the staged GGUF model)."""
-        r = self.ssh(f"sha256sum {path} | cut -d' ' -f1", timeout=600)
+        """sha256 of one file (the staged GGUF model).
+
+        No pipe. `sha256sum X | cut -f1` reports the PIPELINE's status, which
+        is cut's, which is 0 — so a missing or unreadable file came back as
+        returncode 0 with an empty digest, and the before/after comparison in
+        evaluate() then asked `"" != ""` and passed. The model-integrity check
+        silently became a no-op exactly when it mattered. Splitting in Python
+        keeps sha256sum's own exit status, and the shape check is the second
+        lock: any answer that is not 64 hex chars is an error, never a hash.
+        """
+        r = self.ssh(f"sha256sum {path}", timeout=600)
         if r.returncode != 0:
             raise RuntimeError(f"file_hash failed for {path}: {r.stderr.decode()[-500:]}")
-        return r.stdout.decode().strip()
+        out = r.stdout.decode().split()
+        digest = out[0] if out else ""
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise RuntimeError(
+                f"file_hash got a non-sha256 answer for {path}: {digest!r} "
+                f"(stderr: {r.stderr.decode()[-200:]})")
+        return digest
 
 
 # ---------------------------------------------------------------------------
@@ -499,10 +529,23 @@ def diff_name_status(base_sha: str, eval_sha: str) -> list[tuple[str, str]]:
 
 def pr_info(n: int) -> dict:
     return gh_json(["pr", "view", str(n), "--json",
-                    "number,state,isDraft,labels,headRefOid,body,files,comments,title"])
+                    "number,state,isDraft,labels,headRefOid,body,files,comments,"
+                    "title,authorAssociation"])
 
 
 def eligible(info: dict) -> tuple[bool, str]:
+    """(ok, reason). A returning contributor's runtime PR is evaluated with no
+    human in the loop; a first-timer's needs one deliberate act.
+
+    The asymmetry is a spend guard, and it is NOT redundant with GitHub's
+    `first_time_contributors` Actions policy. That policy holds a fork PR's
+    WORKFLOWS until a maintainer approves them — but this bot is a cron job
+    polling `gh pr list`, not a workflow, so nothing about it is gated by that
+    setting. Without the check below, any stranger could start a rented 5090
+    and spend ~40 minutes of GPU time per PR just by opening one. Drawing the
+    line at authorAssociation puts the bot on the same footing GitHub already
+    uses for the same person.
+    """
     labels = [lb["name"] for lb in info.get("labels", [])]
     if info.get("state") != "OPEN":
         return False, "not open"
@@ -513,8 +556,9 @@ def eligible(info: dict) -> tuple[bool, str]:
     paths = [f["path"] for f in info.get("files", [])]
     if not touches_runtime(paths):
         return False, NON_RUNTIME_REASON
-    if not (ticked_5090(info.get("body")) or "eval" in labels):
-        return False, "no 5090 attestation (tick the box, or label `eval` to force)"
+    opted_in = ticked_5090(info.get("body")) or "eval" in labels
+    if not opted_in and not known_contributor(info.get("authorAssociation")):
+        return False, NEEDS_OPT_IN_REASON
     bodies = [c.get("body", "") for c in info.get("comments", [])]
     if already_evaluated(bodies, info["headRefOid"]):
         return False, f"head {info['headRefOid'][:9]} already evaluated"
@@ -562,8 +606,8 @@ def stamp_queue_status(info: dict, ok: bool, why: str) -> None:
         ensure_status(sha, "pending", "queued for measured eval on the RTX 5090")
     elif why == NON_RUNTIME_REASON:
         ensure_status(sha, "success", "eval not required — no runtime paths")
-    elif why.startswith("no 5090 attestation"):
-        ensure_status(sha, "pending", "awaiting the RTX 5090 attestation tick")
+    elif why == NEEDS_OPT_IN_REASON:
+        ensure_status(sha, "pending", "awaiting the RTX 5090 opt-in tick or the `eval` label")
 
 
 def record_evidence(head: str, record: dict) -> None:

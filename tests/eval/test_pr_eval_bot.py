@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
 
@@ -57,7 +58,10 @@ class RuntimePaths(unittest.TestCase):
         self.assertTrue(bot.touches_runtime(["bench/decode_speed.py"]))
 
     def test_docs_and_scripts_do_not(self):
-        self.assertFalse(bot.touches_runtime(["docs/architecture.md", "scripts/x.sh"]))
+        # keep fixture paths out of docs/: scripts/check-release.sh treats any
+        # docs/ string in tracked code as a doc pointer and fails when it does
+        # not resolve
+        self.assertFalse(bot.touches_runtime(["README.md", "scripts/x.sh"]))
 
     def test_prefix_is_a_directory_not_a_substring(self):
         self.assertFalse(bot.touches_runtime(["srcs/other.cpp"]))
@@ -654,6 +658,107 @@ class Eligibility(unittest.TestCase):
     def test_evaluated_head_is_parked(self):
         done = self.info(comments=[{"body": bot.marker("feedbeef1234")}])
         self.assertFalse(bot.eligible(done)[0])
+
+
+class SpendGuard(unittest.TestCase):
+    """Who can start a rented GPU by opening a PR.
+
+    GitHub's `first_time_contributors` Actions policy does NOT cover this: the
+    bot is a cron job polling `gh pr list`, not a workflow, so it never sees
+    that approval gate. These tests are the only thing standing between a
+    stranger's PR and ~40 minutes of billed GPU time.
+    """
+
+    def info(self, **kw):
+        base = {
+            "state": "OPEN", "isDraft": False, "labels": [],
+            "headRefOid": "feedbeef1234",
+            "body": "no tick here",
+            "files": [{"path": "src/runtime/engine.cpp"}], "comments": [],
+            "authorAssociation": "NONE",
+        }
+        base.update(kw)
+        return base
+
+    def test_returning_contributors_need_no_tick(self):
+        for assoc in ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"):
+            with self.subTest(assoc=assoc):
+                ok, why = bot.eligible(self.info(authorAssociation=assoc))
+                self.assertTrue(ok, why)
+
+    def test_first_timers_and_strangers_do_not_auto_spend(self):
+        for assoc in ("NONE", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN"):
+            with self.subTest(assoc=assoc):
+                ok, why = bot.eligible(self.info(authorAssociation=assoc))
+                self.assertFalse(ok)
+                self.assertEqual(why, bot.NEEDS_OPT_IN_REASON)
+
+    def test_a_first_timer_can_opt_in_themselves(self):
+        ticked = self.info(body="- [x] ... maintainer's **RTX 5090** ...")
+        self.assertTrue(bot.eligible(ticked)[0])
+
+    def test_a_maintainer_can_force_with_the_label(self):
+        self.assertTrue(bot.eligible(self.info(labels=[{"name": "eval"}]))[0])
+
+    def test_unknown_or_missing_association_is_treated_as_a_stranger(self):
+        # fail closed: the cost of guessing wrong is a rented GPU
+        for assoc in (None, "", "   ", "SOMETHING_NEW"):
+            with self.subTest(assoc=assoc):
+                self.assertFalse(bot.known_contributor(assoc))
+        self.assertFalse(bot.eligible(self.info(authorAssociation=None))[0])
+
+    def test_association_matching_is_case_insensitive(self):
+        self.assertTrue(bot.known_contributor("contributor"))
+        self.assertTrue(bot.known_contributor(" Owner "))
+
+    def test_the_pr_template_carries_a_tick_the_bot_can_match(self):
+        # the opt-in is worthless if the template never offers it: ticked_5090
+        # needs a checkbox line containing "5090"
+        tpl = (_ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text()
+        offered = [ln for ln in tpl.split("\n") if "5090" in ln and "- [" in ln]
+        self.assertTrue(offered, "PR template offers no 5090 opt-in checkbox")
+        self.assertTrue(bot.ticked_5090(tpl.replace("- [ ]", "- [x]")))
+        self.assertFalse(bot.ticked_5090(tpl))   # unticked template must not opt in
+
+
+class FileHashIntegrity(unittest.TestCase):
+    """The model hash is the one integrity check that runs before any PR code
+    executes. It was silently a no-op: `sha256sum X | cut -f1` reports cut's
+    exit status, so a missing file returned rc=0 and an empty digest, and
+    evaluate() then compared "" against "" and called it verified."""
+
+    class _Stub:
+        def __init__(self, rc, out, err=b""):
+            self._r = subprocess.CompletedProcess([], rc, out, err)
+
+        def ssh(self, cmd, timeout=0):
+            self.cmd = cmd
+            return self._r
+
+    def hash_of(self, rc, out, err=b""):
+        stub = self._Stub(rc, out, err)
+        return bot.Box.file_hash(stub, "/root/models/m.gguf"), stub
+
+    def test_happy_path_returns_the_digest(self):
+        digest = "a" * 64
+        got, stub = self.hash_of(0, f"{digest}  /root/models/m.gguf\n".encode())
+        self.assertEqual(got, digest)
+        self.assertNotIn("|", stub.cmd, "no pipe — it would mask sha256sum's status")
+
+    def test_missing_file_raises_instead_of_returning_empty(self):
+        with self.assertRaises(RuntimeError):
+            self.hash_of(1, b"", b"sha256sum: /root/models/m.gguf: No such file")
+
+    def test_empty_output_with_a_zero_status_still_raises(self):
+        # the exact regression: rc=0 and nothing on stdout
+        with self.assertRaises(RuntimeError):
+            self.hash_of(0, b"")
+
+    def test_non_hex_or_short_answers_raise(self):
+        for out in (b"not-a-hash\n", b"%s\n" % (b"a" * 63), b"%s\n" % (b"g" * 64)):
+            with self.subTest(out=out):
+                with self.assertRaises(RuntimeError):
+                    self.hash_of(0, out)
 
 
 if __name__ == "__main__":

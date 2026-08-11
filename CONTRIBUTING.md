@@ -104,7 +104,9 @@ Body explains *why*, not *what* — the diff already says what changed.
 
 ## What happens to your PR
 
-Perf-sensitive PRs are evaluated by an automated pipeline (`scripts/pr_eval_bot.py`) whose design goal is that **the published verdict is exactly what the committed policy computes from the recorded measurements** — nobody, the maintainer's laptop included, can quietly alter it. Opt in by ticking a `- [x] ... RTX 5090 ...` line in the PR body (or the maintainer applies the `eval` label).
+Perf-sensitive PRs are evaluated by an automated pipeline (`scripts/pr_eval_bot.py`) whose design goal is that **the published verdict is exactly what the committed policy computes from the recorded measurements** — nobody, the maintainer's laptop included, can quietly alter it.
+
+**Who gets evaluated.** If GitHub already lists you as a contributor here (or a member, collaborator, or the owner), any PR touching `src/`, `include/`, `tools/`, `tests/` or `bench/` is picked up automatically within 30 minutes — nothing to tick, no maintainer in the loop. On your **first** PR here, tick the RTX 5090 box in the template to start the eval, or wait for a maintainer to apply the `eval` label. That asymmetry is a spend guard, not a judgement: each run starts a rented GPU for ~40 minutes, and the bot is a cron job rather than a GitHub Action, so it is not covered by the workflow-approval gate that already holds a first-time contributor's CI.
 
 What it does, mechanically:
 
