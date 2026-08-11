@@ -12,10 +12,17 @@ entry: what changed for the reader, plus the number that makes it checkable.
   5090 with a base-pinned harness (`bench/`, `tests/`) and taint policy, a
   deterministic scorer whose verdict is recomputed inside an Intel TDX machine
   (polaris.computer DCAP receipt), and durable evidence via `quench/eval`
-  commit statuses + `refs/notes/quench-eval`. Gates on `tg` only, ±2% bar.
+  commit statuses + `refs/notes/quench-eval`. Gates on `tg` only, ±1.5% bar.
   Design: `scripts/pr_eval_bot.py` docstring; offline check:
   `scripts/verify_receipt.py`; contributor contract: CONTRIBUTING.md
   ("What happens to your PR").
+- feat(eval): the measured verdict now decides the merge. `eval:pass` and
+  `eval:noise` arm GitHub squash auto-merge for any author; the bar moves
+  2.0% → 1.5% (`scorer.NOISE_PCT`, bidirectional — it is the reject bar too).
+  A taint now caps `eval:noise` as well as `eval:pass`, and `cmake/`,
+  `Dockerfile`, `docker-entrypoint.sh`, `docker-compose.yml` join the tainting
+  set: unmeasured by the A/B, so they must not ride a green status into an
+  unattended merge.
 
 - fix(vram): the measured-residual KV clamp now keeps the pending library
   reserve free alongside the allocator headroom — on Mistral-Nemo-12B Q8_0 /

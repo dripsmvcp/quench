@@ -18,10 +18,18 @@ Policy specifics for quench:
     measured and reported, but cuBLAS algorithm selection makes prefill
     vary up to 2.6x across container restarts (see CONTRIBUTING.md,
     "Benchmark") — decode is the reliable A/B signal on this box.
-  * The +-2% noise bar is inherited from the same-session A/B discipline
+  * The +-1.5% noise bar is inherited from the same-session A/B discipline
     (both arms run in one box session, arm order alternated per rep,
     median of reps). It must be re-validated by this repo's own null test
-    (a no-op PR must come back eval:noise, not eval:pass).
+    (a no-op PR must come back eval:noise, not eval:pass). The bar is
+    bidirectional: it is the reject bar as well as the pass bar, so
+    lowering it makes the bot quicker to certify a speedup AND quicker to
+    call a regression. Do not lower it again without re-running the null
+    test on the box.
+  * Verdicts feed auto-merge: eval:pass and eval:noise map to a `success`
+    quench/eval commit status, which main's branch protection requires.
+    A path whose diff needs human eyes must therefore taint (see
+    classify_taint) rather than merely be reported.
 
 Rules for editing: stdlib only, deterministic (no clocks, no randomness, no
 network — egress is sealed anyway), and every printed byte canonical
@@ -40,12 +48,22 @@ import sys
 
 SCHEMA_IN = "quench-eval-bundle/1"
 SCHEMA_OUT = "quench-eval-verdict/1"
-NOISE_PCT = 2.0                            # the same-session bar; also the verdict bar
+NOISE_PCT = 1.5                            # the same-session bar; also the verdict bar
 GATED = ("tg",)                            # workloads that decide the verdict
 PINNED_DIRS = ("bench", "tests")           # harness: taken from base
 INFRA_FILES = ("scripts/pr_eval_bot.py", "scripts/pr_eval_cron.sh",
                "scripts/eval_scorer.py", "scripts/provision_eval_box.sh")
 INFRA_PREFIXES = (".github/",)
+# Supply-chain paths. Not eval infrastructure and not measured by the A/B —
+# they are how the build gets its dependencies and how the container starts,
+# which makes them the highest-value target in the repo for anyone who wants
+# code on main without writing it into src/. touches_runtime() does not cover
+# them, so a PR editing only these would otherwise be stamped "eval not
+# required" -> success -> auto-mergeable unreviewed. Tainting them means the
+# best reachable verdict is eval:tainted (a `failure` status), which holds the
+# merge until a human has read the diff.
+SUPPLY_CHAIN_FILES = ("Dockerfile", "docker-entrypoint.sh", "docker-compose.yml")
+SUPPLY_CHAIN_PREFIXES = ("cmake/",)
 
 
 def median(xs: list[float]) -> float:
@@ -60,9 +78,10 @@ def classify_taint(name_status) -> tuple[list[str], list[str]]:
     """Split a base..PR name-status diff into (tainted, unexercised).
 
     tainted: harness files the PR modifies or deletes, plus any touch at all
-    of the eval infrastructure (this file included). The eval still runs —
-    with the pinned harness, so the numbers stay honest — but the best
-    reachable verdict is eval:tainted; the harness diff needs human eyes.
+    of the eval infrastructure (this file included) or of the supply-chain
+    paths. The eval still runs — with the pinned harness, so the numbers stay
+    honest — but the best reachable verdict is eval:tainted; that diff needs
+    human eyes.
 
     unexercised: files ADDED under pinned dirs. An addition cannot weaken
     the pinned gate, so it does not taint — but the overlay means it never
@@ -70,7 +89,9 @@ def classify_taint(name_status) -> tuple[list[str], list[str]]:
     """
     tainted, unexercised = [], []
     for status, path in (tuple(p) for p in name_status):
-        if path in INFRA_FILES or path.startswith(INFRA_PREFIXES):
+        if (path in INFRA_FILES or path.startswith(INFRA_PREFIXES)
+                or path in SUPPLY_CHAIN_FILES
+                or path.startswith(SUPPLY_CHAIN_PREFIXES)):
             tainted.append(path)
         elif _pinned(path):
             (unexercised if status == "A" else tainted).append(path)
@@ -79,10 +100,19 @@ def classify_taint(name_status) -> tuple[list[str], list[str]]:
 
 def verdict(tests_ok: bool, deltas_pct: dict[str, float],
             tainted=(), noise: float = NOISE_PCT) -> tuple[str, str]:
-    """(label, reason). Regression anywhere outranks improvement anywhere;
-    a taint caps a would-be pass at eval:tainted (the measurement used the
-    pinned harness and is trustworthy — the PR's harness diff is not).
-    deltas_pct holds only the GATED workloads."""
+    """(label, reason). Ladder, strongest first: suite failure, then a measured
+    regression (a regression anywhere outranks an improvement anywhere), then a
+    taint, then pass/noise.
+
+    A taint caps BOTH a would-be pass and a would-be noise at eval:tainted. It
+    used to cap only a pass, which was safe while merging was manual: a tainted
+    no-delta PR read eval:noise and a human still clicked merge. Now that
+    eval:noise is a `success` status and arms auto-merge, that would hand
+    unattended merges to exactly the diffs the taint exists to hold back — a
+    Dockerfile or cmake/ edit has no reason to move decode throughput, so it
+    would land on the noise path every time. The measurement itself stays
+    trustworthy either way (it used the pinned harness); what needs eyes is the
+    diff. deltas_pct holds only the GATED workloads."""
     if not tests_ok:
         return "eval:reject", "pinned test suite failed on the merged tree"
     worst = min(deltas_pct.values())
@@ -90,14 +120,16 @@ def verdict(tests_ok: bool, deltas_pct: dict[str, float],
     if worst < -noise:
         w = min(deltas_pct, key=deltas_pct.get)
         return "eval:reject", f"measured regression at {w}: {deltas_pct[w]:+.1f}%"
+    if tainted:
+        w = max(deltas_pct, key=deltas_pct.get)
+        return "eval:tainted", (
+            f"no regression (best {deltas_pct[w]:+.1f}% at {w}) — but the PR "
+            f"modifies harness or supply-chain files; review them by hand "
+            f"before merging")
     if best > noise:
         w = max(deltas_pct, key=deltas_pct.get)
-        if tainted:
-            return "eval:tainted", (
-                f"measured speedup at {w}: {deltas_pct[w]:+.1f}% — but the PR "
-                f"modifies harness files; review them by hand before merging")
         return "eval:pass", f"measured speedup at {w}: {deltas_pct[w]:+.1f}%"
-    return "eval:noise", (f"all gated deltas within the ±{noise:.0f}% same-session "
+    return "eval:noise", (f"all gated deltas within the ±{noise:.1f}% same-session "
                           f"bar (best {best:+.1f}%)")
 
 

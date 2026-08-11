@@ -152,14 +152,37 @@ class Verdict(unittest.TestCase):
         self.assertIn("tg", reason)
 
     def test_within_the_bar_is_noise_not_pass(self):
-        label, _ = bot.verdict(True, {"tg": 1.9})
+        label, _ = bot.verdict(True, {"tg": 1.4})
         self.assertEqual(label, "eval:noise")
 
     def test_the_bar_itself_is_noise(self):
-        label, _ = bot.verdict(True, {"tg": 2.0})
+        label, _ = bot.verdict(True, {"tg": 1.5})
         self.assertEqual(label, "eval:noise")
-        label, _ = bot.verdict(True, {"tg": -2.0})
+        label, _ = bot.verdict(True, {"tg": -1.5})
         self.assertEqual(label, "eval:noise")
+
+    def test_just_beyond_the_bar_resolves(self):
+        # the deltas that only the 1.5% bar (not the old 2.0%) decides —
+        # these are the cases the threshold change exists to move
+        self.assertEqual(bot.verdict(True, {"tg": 1.6})[0], "eval:pass")
+        self.assertEqual(bot.verdict(True, {"tg": -1.6})[0], "eval:reject")
+
+    def test_the_bar_is_the_single_sourced_constant(self):
+        # guards against a future edit that moves NOISE_PCT but leaves a
+        # hardcoded figure behind in verdict()
+        self.assertEqual(bot.NOISE_PCT, 1.5)
+        eps = 0.01
+        self.assertEqual(bot.verdict(True, {"tg": bot.NOISE_PCT + eps})[0],
+                         "eval:pass")
+        self.assertEqual(bot.verdict(True, {"tg": bot.NOISE_PCT - eps})[0],
+                         "eval:noise")
+
+    def test_the_reason_string_renders_the_bar_faithfully(self):
+        # `:.0f` renders 1.5 as "2" — the reason must not claim a bar the
+        # code does not gate on
+        _, reason = bot.verdict(True, {"tg": 0.1})
+        self.assertIn("1.5%", reason)
+        self.assertNotIn("±2%", reason)
 
 
 class Taint(unittest.TestCase):
@@ -201,6 +224,35 @@ class Taint(unittest.TestCase):
 
     def test_other_scripts_do_not_taint(self):
         t, _ = bot.classify_taint([("M", "scripts/smoke_test.sh")])
+        self.assertEqual(t, [])
+
+    def test_supply_chain_paths_taint(self):
+        # touches_runtime() does not cover these, so without a taint they
+        # would ride a "eval not required" success status into an
+        # unattended merge. Dependency pins and the container entrypoint
+        # are the highest-value target in the repo.
+        for path in ("cmake/quench-deps.cmake", "Dockerfile",
+                     "docker-entrypoint.sh", "docker-compose.yml"):
+            with self.subTest(path=path):
+                t, _ = bot.classify_taint([("M", path)])
+                self.assertEqual(t, [path])
+
+    def test_added_supply_chain_file_taints_too(self):
+        # unlike tests/, an ADDED cmake module is not harmless: it can be
+        # include()d by an existing one
+        t, u = bot.classify_taint([("A", "cmake/evil.cmake")])
+        self.assertEqual(t, ["cmake/evil.cmake"])
+        self.assertEqual(u, [])
+
+    def test_supply_chain_prefix_is_a_directory_not_a_substring(self):
+        t, u = bot.classify_taint([("M", "cmakelists_notes.md"),
+                                   ("M", "docs/Dockerfile.md")])
+        self.assertEqual((t, u), ([], []))
+
+    def test_root_cmakelists_still_does_not_taint(self):
+        # build files are engine-side (they produce the artifact being
+        # measured); the ctest -N superset check is what guards them
+        t, _ = bot.classify_taint([("M", "CMakeLists.txt")])
         self.assertEqual(t, [])
 
 
@@ -246,9 +298,17 @@ class TaintedVerdict(unittest.TestCase):
         self.assertEqual(label, "eval:tainted")
         self.assertIn("harness", reason)
 
-    def test_taint_does_not_upgrade_noise_or_reject(self):
-        self.assertEqual(bot.verdict(True, {"tg": 1.0}, tainted=["tests/t.cu"])[0],
-                         "eval:noise")
+    def test_taint_caps_noise_too(self):
+        # a tainted no-delta PR used to read eval:noise, which was safe while
+        # merging was manual. eval:noise now arms auto-merge, and a Dockerfile
+        # or cmake/ edit has no reason to move decode throughput — so the
+        # noise path is exactly the one such a diff would take.
+        label, reason = bot.verdict(True, {"tg": 1.0}, tainted=["Dockerfile"])
+        self.assertEqual(label, "eval:tainted")
+        self.assertIn("supply-chain", reason)
+        self.assertNotIn(label, bot.AUTO_MERGE_LABELS)
+
+    def test_taint_does_not_upgrade_a_reject(self):
         self.assertEqual(bot.verdict(True, {"tg": -9.0}, tainted=["tests/t.cu"])[0],
                          "eval:reject")
         self.assertEqual(bot.verdict(False, {}, tainted=["tests/t.cu"])[0],
@@ -264,7 +324,7 @@ def synthetic_bundle(**kw):
         "pr": 7, "head": "a" * 40, "eval_sha": "b" * 40, "base_sha": "c" * 40,
         "mode": "merge-vs-main", "workloads": ["pp", "tg"],
         "bench": {"pp_tokens": 512, "tg_tokens": 128, "batch": 1},
-        "reps": 3, "noise_pct": 2.0, "box": "47055458",
+        "reps": 3, "noise_pct": bot.NOISE_PCT, "box": "47055458",
         "model": "Mistral-Nemo-Instruct-2407-Q8_0.gguf", "tests_ok": True,
         "suite_tail_sha256": "0" * 64,
         "samples": {"pr": {"pp": [720.0, 715.0, 718.0], "tg": [199.0, 198.5, 199.4]},
@@ -372,6 +432,188 @@ class DurableEvidence(unittest.TestCase):
         self.assertEqual(bot.STATUS_STATE["eval:tainted"], "failure")
         self.assertEqual(bot.STATUS_STATE["eval:reject"], "failure")
         self.assertEqual(bot.STATUS_STATE["eval:pass"], "success")
+
+
+class AutoMerge(unittest.TestCase):
+    """The label is what .github/workflows/auto-merge.yml keys on, and the
+    status is what main's branch protection requires. If those two disagree
+    the workflow arms a merge the required check then blocks forever."""
+
+    def test_auto_merge_labels_are_real_labels(self):
+        self.assertTrue(set(bot.AUTO_MERGE_LABELS) <= set(bot.EVAL_LABELS))
+
+    def test_every_auto_merge_label_is_a_success_status(self):
+        for label in bot.AUTO_MERGE_LABELS:
+            with self.subTest(label=label):
+                self.assertEqual(bot.STATUS_STATE[label], "success")
+
+    def test_no_other_label_is_a_success_status(self):
+        # the converse: a success status that is NOT an auto-merge label would
+        # satisfy branch protection while the workflow declines to arm — a PR
+        # that is mergeable but never merges
+        success = {lb for lb, st in bot.STATUS_STATE.items() if st == "success"}
+        self.assertEqual(success, set(bot.AUTO_MERGE_LABELS))
+
+    def test_holding_verdicts_are_excluded(self):
+        for label in ("eval:tainted", "eval:reject", "eval:error"):
+            with self.subTest(label=label):
+                self.assertNotIn(label, bot.AUTO_MERGE_LABELS)
+
+
+class ScenarioMatrix(unittest.TestCase):
+    """Every PR shape the bot can meet, end to end: measurements in, then the
+    three things that actually decide the PR's fate — the label the maintainer
+    sees, the commit status branch protection reads, and whether
+    .github/workflows/auto-merge.yml arms an unattended merge.
+
+    The per-rule tests above check each hop in isolation. This one exists
+    because the hops are wired together by hand (verdict -> STATUS_STATE ->
+    AUTO_MERGE_LABELS -> a string literal in a YAML file), and a merge gate
+    that is right in three places and wrong in the join is still wrong.
+    """
+
+    MAIN_TG = 200.0
+
+    def bundle(self, *, delta_pct=0.0, name_status=(("M", "src/runtime/engine.cpp"),),
+               tests_ok=True):
+        pr_tg = self.MAIN_TG * (1 + delta_pct / 100.0)
+        if not tests_ok:
+            return synthetic_bundle(tests_ok=False, samples={},
+                                    name_status=[list(p) for p in name_status])
+        return synthetic_bundle(
+            tests_ok=True,
+            name_status=[list(p) for p in name_status],
+            samples={"pr": {"pp": [700.0], "tg": [pr_tg]},
+                     "main": {"pp": [700.0], "tg": [self.MAIN_TG]}})
+
+    # scenario, kwargs, expected label, expected commit status, merges unattended
+    CASES = (
+        ("clean speedup well beyond the bar",
+         dict(delta_pct=6.0), "eval:pass", "success", True),
+        ("clean speedup just beyond the bar",
+         dict(delta_pct=1.6), "eval:pass", "success", True),
+        ("exactly on the bar is noise, not a pass",
+         dict(delta_pct=1.5), "eval:noise", "success", True),
+        ("perf-neutral bugfix",
+         dict(delta_pct=0.0), "eval:noise", "success", True),
+        ("small regression inside the bar",
+         dict(delta_pct=-1.4), "eval:noise", "success", True),
+        ("regression just beyond the bar",
+         dict(delta_pct=-1.6), "eval:reject", "failure", False),
+        ("regression well beyond the bar",
+         dict(delta_pct=-20.0), "eval:reject", "failure", False),
+        ("suite failure outranks a huge speedup",
+         dict(delta_pct=50.0, tests_ok=False), "eval:reject", "failure", False),
+        ("speedup while editing the pinned bench",
+         dict(delta_pct=6.0, name_status=(("M", "bench/decode_speed.py"),)),
+         "eval:tainted", "failure", False),
+        ("speedup while weakening a pinned oracle",
+         dict(delta_pct=6.0, name_status=(("M", "tests/refs/e2e_greedy_locks.h"),)),
+         "eval:tainted", "failure", False),
+        ("speedup while editing the scorer itself",
+         dict(delta_pct=6.0, name_status=(("M", "scripts/eval_scorer.py"),)),
+         "eval:tainted", "failure", False),
+        ("speedup while editing a workflow",
+         dict(delta_pct=6.0, name_status=(("M", ".github/workflows/ci.yml"),)),
+         "eval:tainted", "failure", False),
+        # the cases the supply-chain taint was added for: no plausible effect
+        # on decode throughput, so without the taint they ride the noise path
+        ("engine change plus a dependency-pin edit, no delta",
+         dict(delta_pct=0.2, name_status=(("M", "src/runtime/engine.cpp"),
+                                          ("M", "cmake/quench-deps.cmake"))),
+         "eval:tainted", "failure", False),
+        ("engine change plus a Dockerfile edit, no delta",
+         dict(delta_pct=0.0, name_status=(("M", "src/compute/gemm.cu"),
+                                          ("M", "Dockerfile"))),
+         "eval:tainted", "failure", False),
+        ("engine change plus a container-entrypoint edit, no delta",
+         dict(delta_pct=-0.3, name_status=(("M", "src/compute/gemm.cu"),
+                                           ("M", "docker-entrypoint.sh"))),
+         "eval:tainted", "failure", False),
+        ("regression outranks the taint",
+         dict(delta_pct=-9.0, name_status=(("M", "Dockerfile"),)),
+         "eval:reject", "failure", False),
+        # additions under pinned paths are reported, not punished
+        ("speedup plus a newly added test",
+         dict(delta_pct=6.0, name_status=(("M", "src/compute/gemm.cu"),
+                                          ("A", "tests/test_new_kernel.cu"))),
+         "eval:pass", "success", True),
+        ("root CMakeLists edit is engine-side, not a taint",
+         dict(delta_pct=6.0, name_status=(("M", "CMakeLists.txt"),)),
+         "eval:pass", "success", True),
+    )
+
+    def test_matrix(self):
+        for scenario, kw, label, status, merges in self.CASES:
+            with self.subTest(scenario=scenario):
+                v = bot.scorer.score_bundle(self.bundle(**kw))
+                self.assertEqual(v["label"], label, v["reason"])
+                self.assertEqual(bot.STATUS_STATE[v["label"]], status)
+                self.assertEqual(v["label"] in bot.AUTO_MERGE_LABELS, merges,
+                                 f"{scenario}: wrong merge decision")
+
+    def test_matrix_covers_every_label_the_bot_can_apply(self):
+        # eval:error is not reachable through the scorer — it is the
+        # exception path in evaluate() — so it is excluded by name here
+        # rather than silently missing from the matrix.
+        seen = {bot.scorer.score_bundle(self.bundle(**kw))["label"]
+                for _, kw, _, _, _ in self.CASES}
+        self.assertEqual(seen, set(bot.EVAL_LABELS) - {"eval:error"})
+
+    def test_eval_error_never_merges(self):
+        self.assertEqual(bot.STATUS_STATE["eval:error"], "error")
+        self.assertNotIn("eval:error", bot.AUTO_MERGE_LABELS)
+
+    def test_no_tainted_scenario_is_ever_mergeable(self):
+        # the property behind the individual rows: taint and merge are
+        # mutually exclusive whatever the measurement says
+        for delta in (-50.0, -1.6, -1.5, 0.0, 1.5, 1.6, 50.0):
+            with self.subTest(delta=delta):
+                v = bot.scorer.score_bundle(
+                    self.bundle(delta_pct=delta,
+                                name_status=(("M", "cmake/quench-deps.cmake"),)))
+                self.assertNotIn(v["label"], bot.AUTO_MERGE_LABELS)
+
+
+class WorkflowWiring(unittest.TestCase):
+    """The last hop is a string literal in a YAML file that no Python test
+    would otherwise touch. Checked as raw text on purpose: what matters is
+    exactly what is written in the file, not what a YAML loader normalizes it
+    to, and keeping this stdlib-only keeps the suite runnable as a bare
+    `python3` script under ctest."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (_ROOT / ".github/workflows/auto-merge.yml").read_text()
+
+    def test_the_workflow_gates_on_exactly_the_bots_merge_labels(self):
+        import re
+        found = set(re.findall(r"github\.event\.label\.name\s*==\s*'([^']+)'",
+                               self.text))
+        self.assertEqual(found, set(bot.AUTO_MERGE_LABELS),
+                         "auto-merge.yml and AUTO_MERGE_LABELS have drifted")
+
+    def test_every_gated_label_is_one_the_bot_actually_applies(self):
+        import re
+        found = set(re.findall(r"github\.event\.label\.name\s*==\s*'([^']+)'",
+                               self.text))
+        self.assertTrue(found <= set(bot.EVAL_LABELS),
+                        "workflow waits for a label the bot never applies")
+
+    def test_privileged_trigger_never_checks_out_pr_code(self):
+        # pull_request_target runs with a write token in the base repo's
+        # context; a checkout here would execute fork code with that token
+        self.assertIn("pull_request_target", self.text)
+        self.assertNotIn("actions/checkout", self.text)
+
+    def test_privileged_trigger_is_limited_to_the_labeled_event(self):
+        import re
+        block = self.text.split("pull_request_target:", 1)[1]
+        types = re.search(r"types:\s*\[([^\]]*)\]", block).group(1)
+        self.assertEqual([t.strip() for t in types.split(",")], ["labeled"])
+
+    def test_draft_prs_are_excluded_from_both_paths(self):
+        self.assertEqual(self.text.count("draft == false"), 2)
 
 
 class Eligibility(unittest.TestCase):
