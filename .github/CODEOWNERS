@@ -18,9 +18,16 @@
 #
 # CODEOWNERS is enforced by GitHub itself and holds in both cases.
 #
-# NOTE: on its own this file only REQUESTS review. It blocks nothing until
-# branch protection on main sets required_pull_request_reviews with
-# require_code_owner_reviews = true. See CONTRIBUTING.md.
+# ENFORCED. main's branch protection sets require_code_owner_reviews = true
+# with required_approving_review_count = 0 — so a PR touching a path below
+# needs a code-owner approval, while a PR touching nothing here needs no
+# approval at all and can still merge unattended. Dropping the count to 0 is
+# what keeps this from becoming a review requirement on every PR in the repo.
+#
+# Consequence for a solo maintainer: GitHub does not let you approve your own
+# PR, so the owner's own changes to these paths merge only with an admin
+# override. That is the intended cost — these are the paths where "the
+# pipeline said it was fine" is not sufficient. See CONTRIBUTING.md.
 
 # --- eval infrastructure: the bot, the policy it applies, how it is run -----
 /scripts/pr_eval_bot.py         @dripsmvcp
