@@ -5,6 +5,9 @@ entry: what changed for the reader, plus the number that makes it checkable.
 
 ## [Unreleased]
 
+- docs(readme): publish first comparative benchmark — Mistral-Nemo-12B on RTX
+  5090, decode tg128: quench 188.5 tok/s (226.6 with n-gram spec) vs llama.cpp
+  118.2 vs vLLM-BF16 ~65.5; same Q8_0 GGUF for quench/llama.cpp, pp512/tg128 ×3.
 - feat(eval): trust-minimized PR evaluation — same-session A/B on the rented
   5090 with a base-pinned harness (`bench/`, `tests/`) and taint policy, a
   deterministic scorer whose verdict is recomputed inside an Intel TDX machine
