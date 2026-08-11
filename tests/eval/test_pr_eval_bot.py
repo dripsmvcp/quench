@@ -721,6 +721,37 @@ class SpendGuard(unittest.TestCase):
         self.assertFalse(bot.ticked_5090(tpl))   # unticked template must not opt in
 
 
+class CronWrapper(unittest.TestCase):
+    """The cron wrapper decides WHICH tree grades other people's PRs, and its
+    own install snippet is the documentation people paste. Both were wrong."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (_ROOT / "scripts/pr_eval_cron.sh").read_text()
+
+    def test_install_snippet_points_at_this_repo(self):
+        # it used to echo a path in a different repo, so following it never
+        # installed quench's cron at all
+        snippet = [ln for ln in self.text.split("\n")
+                   if "crontab" in ln and "pr_eval_cron.sh" in ln]
+        self.assertTrue(snippet, "no install snippet found")
+        self.assertFalse([ln for ln in snippet if "plind-junior" in ln or "/imp/" in ln],
+                         "install snippet still points at another repo")
+
+    def test_install_snippet_filter_is_repo_specific(self):
+        # `grep -v pr_eval_cron.sh` would strip another project's cron line too
+        for ln in self.text.split("\n"):
+            if "grep -v" in ln and "pr_eval_cron.sh" in ln:
+                self.assertIn("quench/scripts/pr_eval_cron.sh", ln)
+
+    def test_it_refuses_to_run_off_main(self):
+        # the tree it runs from IS the policy — and the attested one
+        self.assertIn("!= \"main\"", self.text)
+
+    def test_it_refuses_with_a_dirty_policy_tree(self):
+        self.assertIn("git diff --quiet HEAD -- scripts/ bench/ tests/", self.text)
+
+
 class FileHashIntegrity(unittest.TestCase):
     """The model hash is the one integrity check that runs before any PR code
     executes. It was silently a no-op: `sha256sum X | cut -f1` reports cut's

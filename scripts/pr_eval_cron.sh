@@ -31,6 +31,23 @@ LOG="${QUENCH_EVAL_LOG:-$HOME/quench-pr-eval.log}"
 
 exec 9>"$HOME/.quench-pr-eval.lock"
 flock -n 9 || exit 0
+
+# The verdict policy is whatever is checked out HERE: the bot imports
+# scripts/eval_scorer.py from this tree, and ships that same file into the TEE
+# as the attested policy. A dev machine sitting on a feature branch would
+# therefore grade other people's PRs — and publish attested receipts — with
+# uncommitted, unreviewed rules. The bot's docstring has always claimed it
+# "runs from the local main tree"; these two checks are what make that true.
+# Skip rather than fail: a poll that lands mid-edit is normal, not an incident.
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+if [ "$branch" != "main" ]; then
+  echo "=== $(date -Is) skip: on '$branch', not main" >>"$LOG"
+  exit 0
+fi
+if ! git diff --quiet HEAD -- scripts/ bench/ tests/; then
+  echo "=== $(date -Is) skip: uncommitted changes under scripts/, bench/ or tests/" >>"$LOG"
+  exit 0
+fi
 {
   echo "=== $(date -Is) pr-eval poll"
   # -u: unbuffered, so a 30-minute eval's progress is readable in the log
