@@ -528,9 +528,26 @@ def diff_name_status(base_sha: str, eval_sha: str) -> list[tuple[str, str]]:
 # GitHub layer
 
 def pr_info(n: int) -> dict:
-    return gh_json(["pr", "view", str(n), "--json",
-                    "number,state,isDraft,labels,headRefOid,body,files,comments,"
-                    "title,authorAssociation"])
+    """PR fields the policy needs, plus the author's association.
+
+    `gh pr view --json` has no authorAssociation field — asking for one makes
+    the whole call exit 1, which took every poll down until this was split
+    out. The REST payload does carry `author_association`, so it comes from a
+    second call. That call is allowed to fail: a transient API error must not
+    crash a poll, and an empty association reads as "stranger", which is the
+    safe direction (it asks for the opt-in tick rather than spending a GPU).
+    """
+    info = gh_json(["pr", "view", str(n), "--json",
+                    "number,state,isDraft,labels,headRefOid,body,files,comments,title"])
+    try:
+        assoc = gh(["api", f"repos/{{owner}}/{{repo}}/pulls/{n}",
+                    "--jq", ".author_association"]).strip()
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"!! PR #{n}: author association unavailable ({e}); "
+              f"treating as first-time", file=sys.stderr)
+        assoc = ""
+    info["authorAssociation"] = assoc
+    return info
 
 
 def eligible(info: dict) -> tuple[bool, str]:
