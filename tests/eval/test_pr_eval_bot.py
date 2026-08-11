@@ -721,6 +721,41 @@ class SpendGuard(unittest.TestCase):
         self.assertFalse(bot.ticked_5090(tpl))   # unticked template must not opt in
 
 
+class PrInfoFields(unittest.TestCase):
+    """`gh pr view --json` rejects the WHOLE call on one unknown field name.
+
+    Every test in this file hand-builds the info dict, so none of them touch
+    pr_info — which is how `authorAssociation` (a REST-only field) shipped in
+    the gh-pr-view list and took down every cron poll with exit 1. These read
+    the source rather than call gh, because the suite has no network; they
+    pin the shape of the fix, not gh's field catalogue.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        src = (_ROOT / "scripts/pr_eval_bot.py").read_text()
+        body = src.split("def pr_info(", 1)[1].split("\ndef ", 1)[0]
+        cls.body = body
+        cls.view_fields = set()
+        for chunk in body.split('"'):
+            if "headRefOid" in chunk:
+                cls.view_fields = {f.strip() for f in chunk.split(",") if f.strip()}
+
+    def test_the_view_call_still_asks_for_what_the_policy_reads(self):
+        self.assertTrue({"state", "isDraft", "labels", "headRefOid", "body",
+                         "files", "comments"} <= self.view_fields)
+
+    def test_rest_only_fields_are_not_in_the_view_call(self):
+        # the exact regression: one bad name fails the entire call
+        for bad in ("authorAssociation", "author_association"):
+            self.assertNotIn(bad, self.view_fields)
+
+    def test_the_association_is_fetched_and_defaults_to_stranger(self):
+        self.assertIn("author_association", self.body)      # from the REST payload
+        self.assertIn('assoc = ""', self.body)              # fails closed
+        self.assertIn('info["authorAssociation"]', self.body)
+
+
 class CronWrapper(unittest.TestCase):
     """The cron wrapper decides WHICH tree grades other people's PRs, and its
     own install snippet is the documentation people paste. Both were wrong."""
