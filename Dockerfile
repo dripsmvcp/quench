@@ -18,7 +18,7 @@
 # INCREMENTAL ninja build against a persistent build dir, so a one-file edit
 # costs seconds instead of the full-image rebuild's minutes. The final image is
 # byte-for-byte what it was — `builder` still starts from exactly these layers.
-FROM nvidia/cuda:13.3.1-devel-ubuntu26.04 AS toolchain
+FROM nvidia/cuda:13.4.2-devel-ubuntu26.04 AS toolchain
 
 ARG CMAKE_BUILD_TYPE=Release
 
@@ -97,7 +97,7 @@ RUN cmake -B build -G Ninja \
 # Native CUDA 13.3 runtime image already ships the matching cudart + cuBLAS
 # (and transitive deps like libnvjitlink) at /usr/local/cuda; only the small
 # entrypoint/healthcheck helpers need adding.
-FROM nvidia/cuda:13.3.1-runtime-ubuntu26.04
+FROM nvidia/cuda:13.4.2-runtime-ubuntu26.04
 
 # OCI image metadata — GHCR renders org.opencontainers.image.description on the
 # package page (https://github.com/dripsmvcp/quench/pkgs/container/quench). Hardcoded here
